@@ -202,12 +202,18 @@ def _load_default_api_key() -> str:
 with st.sidebar:
     st.header("⚙️ 設定")
     default_key = _load_default_api_key()
-    api_key = st.text_input(
-        "Gemini API Key",
-        type="password",
-        value=default_key,
-        help="到 https://aistudio.google.com/apikey 免費申請；也可設環境變數 GEMINI_API_KEY",
-    )
+    if default_key:
+        st.success("✅ Gemini API 已連接（透過 Secrets 載入）")
+        api_key = default_key
+    else:
+        api_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            value="",
+            help="到 https://aistudio.google.com/apikey 免費申請；"
+            "若部署在 Streamlit Cloud，建議到 Settings → Secrets 設定 GEMINI_API_KEY，"
+            "之後就不用每次貼。",
+        )
     model = st.selectbox(
         "模型",
         MODEL_OPTIONS,
