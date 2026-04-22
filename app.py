@@ -448,7 +448,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("📘 學生個人檔案（選填，長期特質）", expanded=False):
-        if _profile_storage is None:
+        if _storage is None:
             st.caption(
                 "⚠️ 沒裝 streamlit-local-storage，檔案只會保留到本次 session。"
                 "重啟或重新整理後會消失。"
