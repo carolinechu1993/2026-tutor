@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import streamlit as st
@@ -152,15 +153,14 @@ def _try_one_model(
 
 def generate_paragraph(
     client, model: str, name: str, notes: str, length: str
-) -> str:
+) -> tuple[str, str]:
+    """回傳 (段落內文, 實際使用的模型名稱)。若主模型過載自動 fallback，實際模型會與 model 不同。"""
     models_to_try = FALLBACK_CHAIN.get(model, [model])
     errors: list[str] = []
-    for idx, candidate in enumerate(models_to_try):
+    for candidate in models_to_try:
         try:
             text = _try_one_model(client, candidate, name, notes, length)
-            if idx > 0:
-                st.info(f"⚠️ 主模型 {model} 過載，已自動改用 {candidate} 產生。")
-            return text
+            return text, candidate
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{candidate}: {exc}")
             if not _is_transient(exc):
@@ -316,10 +316,12 @@ for name in st.session_state.students:
             else:
                 with st.spinner(f"為 {name} 產生段落中..."):
                     try:
-                        para = generate_paragraph(
+                        para, used = generate_paragraph(
                             client, model, name, notes_val, length_val
                         )
                         st.session_state[f"out_{name}"] = para
+                        if used != model:
+                            st.info(f"⚠️ 主模型 {model} 過載，自動改用 {used} 產生。")
                     except Exception as exc:  # noqa: BLE001
                         st.error(f"產生失敗：{exc}")
 
@@ -343,27 +345,58 @@ if bulk_clicked:
     if not client:
         st.error("請先在左側填入 Gemini API Key")
     else:
-        prog = st.progress(0.0, text="準備中...")
-        total = len(st.session_state.students)
-        pending: dict[str, str] = {}
-        failures: list[str] = []
-        for i, name in enumerate(st.session_state.students):
+        # 1. 在主執行緒先搜集所有學生的輸入，工作執行緒不要碰 st.session_state
+        tasks: list[tuple[str, str, str]] = []
+        for name in st.session_state.students:
             notes_val = assemble_notes(name)
-            length_val = st.session_state.get(f"len_{name}", "中")
-            prog.progress(i / max(total, 1), text=f"產生 {name} 中...")
             if not notes_val.strip():
                 continue
-            try:
-                pending[name] = generate_paragraph(
-                    client, model, name, notes_val, length_val
-                )
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"{name}：{exc}")
-        prog.progress(1.0, text="完成")
-        st.session_state._pending_outputs = pending
-        if failures:
-            st.session_state._pending_failures = failures
-        st.rerun()
+            length_val = st.session_state.get(f"len_{name}", "中")
+            tasks.append((name, notes_val, length_val))
+
+        if not tasks:
+            st.info("沒有填寫任何學生的重點，略過產生。")
+        else:
+            start = time.time()
+            prog = st.progress(0.0, text=f"同時產生 {len(tasks)} 位學生...")
+            pending: dict[str, str] = {}
+            failures: list[str] = []
+            fallback_notices: list[str] = []
+
+            # 2. 平行發 API 請求。每位學生一個 worker，Gemini 免費 tier 每分鐘 10–15 RPM 綽綽有餘。
+            with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as pool:
+                future_to_name = {
+                    pool.submit(
+                        generate_paragraph, client, model, n, nt, ln
+                    ): n
+                    for n, nt, ln in tasks
+                }
+                done = 0
+                for future in as_completed(future_to_name):
+                    name = future_to_name[future]
+                    done += 1
+                    try:
+                        text, used = future.result()
+                        pending[name] = text
+                        if used != model:
+                            fallback_notices.append(
+                                f"{name}：主模型過載，改用 {used}"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append(f"{name}：{exc}")
+                    prog.progress(
+                        done / len(tasks),
+                        text=f"已完成 {done}/{len(tasks)}",
+                    )
+
+            elapsed = time.time() - start
+            prog.progress(1.0, text=f"完成（共 {elapsed:.1f} 秒）")
+            st.session_state._pending_outputs = pending
+            if failures:
+                st.session_state._pending_failures = failures
+            if fallback_notices:
+                st.session_state._pending_fallbacks = fallback_notices
+            st.rerun()
 
 if clear_clicked:
     st.session_state._pending_outputs = {
@@ -371,11 +404,16 @@ if clear_clicked:
     }
     st.rerun()
 
-# 顯示上一輪批次產生的失敗訊息（如果有）
+# 顯示上一輪批次產生的訊息（失敗、fallback）
 if st.session_state.get("_pending_failures"):
     for msg in st.session_state._pending_failures:
         st.warning(msg)
     st.session_state._pending_failures = []
+
+if st.session_state.get("_pending_fallbacks"):
+    for msg in st.session_state._pending_fallbacks:
+        st.info(f"⚠️ {msg}")
+    st.session_state._pending_fallbacks = []
 
 
 st.divider()
