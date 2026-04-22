@@ -11,6 +11,7 @@ Gemini API key 申請：https://aistudio.google.com/apikey （免費額度足以
 from __future__ import annotations
 
 import os
+import time
 from datetime import date
 
 import streamlit as st
@@ -79,20 +80,53 @@ def build_user_prompt(name: str, notes: str, length: str) -> str:
     )
 
 
-def generate_paragraph(client, model: str, name: str, notes: str, length: str) -> str:
-    response = client.models.generate_content(
-        model=model,
-        contents=build_user_prompt(name, notes, length),
-        config=genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=800,
-            temperature=0.85,
-        ),
-    )
-    text = (response.text or "").strip()
-    if not text:
-        raise RuntimeError("Gemini 沒有回傳文字（可能被安全過濾器擋下，請調整輸入重試）")
-    return text
+TRANSIENT_ERROR_TOKENS = (
+    "503",
+    "502",
+    "429",
+    "UNAVAILABLE",
+    "RESOURCE_EXHAUSTED",
+    "overloaded",
+    "high demand",
+    "DEADLINE_EXCEEDED",
+)
+
+
+def generate_paragraph(
+    client, model: str, name: str, notes: str, length: str, max_retries: int = 3
+) -> str:
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=build_user_prompt(name, notes, length),
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=800,
+                    temperature=0.85,
+                ),
+            )
+            text = (response.text or "").strip()
+            if not text:
+                raise RuntimeError(
+                    "Gemini 沒有回傳文字（可能被安全過濾器擋下，請調整輸入重試）"
+                )
+            return text
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if any(tok in str(exc) for tok in TRANSIENT_ERROR_TOKENS):
+                if attempt < max_retries - 1:
+                    time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s
+                    continue
+                raise RuntimeError(
+                    "Gemini 目前忙碌中（模型過載），重試幾次仍失敗。"
+                    "請稍等 10–30 秒再按一次，或到左側把模型切換到 gemini-2.0-flash 試試。"
+                ) from exc
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("unknown error")
 
 
 st.set_page_config(page_title="課輔交接產生器", page_icon="📝", layout="wide")
