@@ -91,11 +91,20 @@ TRANSIENT_ERROR_TOKENS = (
     "DEADLINE_EXCEEDED",
 )
 
+FALLBACK_CHAIN = {
+    "gemini-2.5-flash": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"],
+    "gemini-2.5-pro": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+    "gemini-2.0-flash": ["gemini-2.0-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash"],
+}
 
-def generate_paragraph(
-    client, model: str, name: str, notes: str, length: str, max_retries: int = 3
+
+def _is_transient(exc: Exception) -> bool:
+    return any(tok in str(exc) for tok in TRANSIENT_ERROR_TOKENS)
+
+
+def _try_one_model(
+    client, model: str, name: str, notes: str, length: str, max_retries: int = 2
 ) -> str:
-    last_exc: Exception | None = None
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -114,19 +123,33 @@ def generate_paragraph(
                 )
             return text
         except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if any(tok in str(exc) for tok in TRANSIENT_ERROR_TOKENS):
-                if attempt < max_retries - 1:
-                    time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s
-                    continue
-                raise RuntimeError(
-                    "Gemini 目前忙碌中（模型過載），重試幾次仍失敗。"
-                    "請稍等 10–30 秒再按一次，或到左側把模型切換到 gemini-2.0-flash 試試。"
-                ) from exc
+            if _is_transient(exc) and attempt < max_retries - 1:
+                time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s
+                continue
             raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("unknown error")
+
+
+def generate_paragraph(
+    client, model: str, name: str, notes: str, length: str
+) -> str:
+    models_to_try = FALLBACK_CHAIN.get(model, [model])
+    errors: list[str] = []
+    for idx, candidate in enumerate(models_to_try):
+        try:
+            text = _try_one_model(client, candidate, name, notes, length)
+            if idx > 0:
+                st.info(f"⚠️ 主模型 {model} 過載，已自動改用 {candidate} 產生。")
+            return text
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{candidate}: {exc}")
+            if not _is_transient(exc):
+                # 非過載錯誤（金鑰錯、安全過濾、quota、其他）就不繼續試
+                raise
+            continue
+    raise RuntimeError(
+        "所有 Gemini 備援模型目前都在過載中。請稍等 30–60 秒再試。\n\n"
+        + "\n".join(errors)
+    )
 
 
 st.set_page_config(page_title="課輔交接產生器", page_icon="📝", layout="wide")
