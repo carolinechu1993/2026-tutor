@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
@@ -275,6 +276,11 @@ def length_feedback(text: str, target: str) -> tuple[str, str]:
     return (f"⚠️ 目前 {count} 字｜{direction}（{target}長度目標 {low}–{high}）", "warn")
 
 
+def line_share_url(text: str) -> str:
+    """產生一個 LINE 分享連結（手機點了開 LINE App、桌機點了開 LINE 網頁）。"""
+    return f"https://line.me/R/msg/text/?{urllib.parse.quote(text)}"
+
+
 def _load_default_api_key() -> str:
     try:
         for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
@@ -315,18 +321,22 @@ with st.sidebar:
 
     st.divider()
     st.subheader("👥 學生名單")
-    st.caption("每行一位，可直接在下面新增／刪除")
+    st.caption("每行一位。直接編輯：刪一行 = 刪學生；加一行 = 加新學生。")
     st.text_area(
-        "學生名單",
+        "學生名單（每行一位）",
         key="students_text_area",
         height=180,
-        label_visibility="collapsed",
+        placeholder="薛恩銘\n李妮綺\n潘奕亨\n蔡柏容\n張鈺淇",
     )
     parsed_students = [
         s.strip() for s in st.session_state.students_text_area.splitlines() if s.strip()
     ]
     if parsed_students:
         st.session_state.students = parsed_students
+    if st.button("↩️ 還原預設學生名單", use_container_width=True):
+        st.session_state.students_text_area = "\n".join(DEFAULT_STUDENTS)
+        st.session_state.students = DEFAULT_STUDENTS.copy()
+        st.rerun()
 
     st.divider()
     with st.expander("📘 學生個人檔案（選填，長期特質）", expanded=False):
@@ -441,7 +451,17 @@ for name in st.session_state.students:
         _current = st.session_state.get(f"out_{name}", "")
         _target = st.session_state.get(f"len_{name}", "中")
         _msg, _ = length_feedback(_current, _target)
-        st.caption(_msg)
+        _caption_col, _share_col = st.columns([3, 1])
+        with _caption_col:
+            st.caption(_msg)
+        with _share_col:
+            if _current.strip():
+                _share_text = f"{prefix}{name}：{_current.strip()}"
+                st.link_button(
+                    "📲 分享到 LINE",
+                    line_share_url(_share_text),
+                    use_container_width=True,
+                )
 
 
 st.divider()
@@ -545,10 +565,29 @@ _student_count = len(lines) - 1  # 扣掉標題行
 if _student_count > 0:
     st.caption(f"📊 共 {_student_count} 位學生段落 ｜ 內文總字數 {_total_chars}")
 
-st.download_button(
-    "💾 下載 .txt",
-    data=final_text,
-    file_name=f"{entry_date.isoformat()}_{class_name}.txt",
-    mime="text/plain",
-    disabled=not final_text.strip() or final_text.strip() == header.strip(),
-)
+_has_content = bool(final_text.strip()) and final_text.strip() != header.strip()
+
+_dl_col, _share_all_col, _ = st.columns([1, 1, 2])
+with _dl_col:
+    st.download_button(
+        "💾 下載 .txt",
+        data=final_text,
+        file_name=f"{entry_date.isoformat()}_{class_name}.txt",
+        mime="text/plain",
+        disabled=not _has_content,
+        use_container_width=True,
+    )
+with _share_all_col:
+    if _has_content:
+        st.link_button(
+            "📲 分享全部到 LINE",
+            line_share_url(final_text),
+            use_container_width=True,
+        )
+    else:
+        st.button(
+            "📲 分享全部到 LINE",
+            disabled=True,
+            use_container_width=True,
+            help="產生段落後才能分享",
+        )
