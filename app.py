@@ -16,7 +16,12 @@ import re
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9 後援（Streamlit Cloud 是 3.11，用不到）
+    ZoneInfo = None  # type: ignore
 
 import streamlit as st
 
@@ -34,6 +39,14 @@ except ImportError:
 
 
 DEFAULT_STUDENTS = ["薛恩銘", "李妮綺", "潘奕亨", "蔡柏容", "張鈺淇"]
+TAIPEI_TZ = ZoneInfo("Asia/Taipei") if ZoneInfo else None
+
+
+def today_in_taipei() -> date:
+    """取台灣時區的今天日期，避免 Streamlit Cloud（UTC）在台灣凌晨/清晨算錯。"""
+    if TAIPEI_TZ is None:
+        return date.today()
+    return datetime.now(TAIPEI_TZ).date()
 WEEKDAY_MAP = ["一", "二", "三", "四", "五", "六", "日"]
 MODEL_OPTIONS = [
     "gemini-2.5-flash",
@@ -316,7 +329,7 @@ with st.sidebar:
     st.divider()
     st.subheader("📅 班級 / 日期")
     class_name = st.text_input("班級名稱", value="甲圍A班")
-    entry_date = st.date_input("日期", value=date.today())
+    entry_date = st.date_input("日期", value=today_in_taipei())
     prefix = st.text_input("段落前綴（例如 😊 或 @）", value="😊", max_chars=4)
 
     st.divider()
