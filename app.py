@@ -10,7 +10,9 @@ Gemini API key 申請：https://aistudio.google.com/apikey （免費額度足以
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -23,6 +25,11 @@ try:
 except ImportError:  # 讓介面在未安裝 SDK 時也能顯示說明
     genai = None  # type: ignore
     genai_types = None  # type: ignore
+
+try:
+    from streamlit_local_storage import LocalStorage
+except ImportError:
+    LocalStorage = None  # type: ignore
 
 
 DEFAULT_STUDENTS = ["薛恩銘", "李妮綺", "潘奕亨", "蔡柏容", "張鈺淇"]
@@ -86,19 +93,29 @@ def assemble_notes(name: str) -> str:
     return "\n".join(lines)
 
 
+LENGTH_RANGES = {
+    "短": (65, 90),
+    "中": (95, 125),
+    "長": (150, 190),
+}
+
+
 def build_user_prompt(name: str, notes: str, length: str) -> str:
-    length_hint = {
-        "短": "約 75 字（允許範圍 65–90 字）",
-        "中": "約 110 字（允許範圍 95–125 字）",
-        "長": "約 170 字（允許範圍 150–190 字）",
-    }[length]
+    low, high = LENGTH_RANGES[length]
+    profile = st.session_state.get(f"profile_{name}", "").strip()
+    profile_block = (
+        f"\n【{name} 的長期個性／習慣】（寫段落時請呼應這些特質，但不要直接引用這段文字）：\n{profile}\n"
+        if profile
+        else ""
+    )
     return (
-        f"請為學生「{name}」撰寫今日課程交接段落。\n\n"
+        f"請為學生「{name}」撰寫今日課程交接段落。"
+        f"{profile_block}\n"
         f"今日觀察關鍵字／短句（依欄位分類）：\n{notes.strip()}\n\n"
         f"要求：\n"
-        f"- 長度：{length_hint}。請務必在此範圍內，超過或不足都要修正。\n"
-        f"- 直接輸出段落內文，不要加姓名前綴、不要加標題、不要加引號、不要加字數統計。\n"
-        f"- 只輸出一段文字。"
+        f"- **涵蓋度**：上述「今日觀察」中的**每一個關鍵字或短句都必須在段落中明確出現或具體描述**，不得省略、不得含糊帶過。寫完後請自己核對一次。\n"
+        f"- **長度**：嚴格控制在 {low}–{high} 字之間（目標約 {(low+high)//2} 字），中文字一個算一個，標點不算。超過或不足都要修正重寫。\n"
+        f"- **輸出**：直接輸出段落內文，不要加姓名前綴、不要加標題、不要加引號、不要加字數統計、不要加任何說明。只輸出一段文字。"
     )
 
 
@@ -135,7 +152,7 @@ def _try_one_model(
                 config=genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     max_output_tokens=800,
-                    temperature=0.85,
+                    temperature=0.7,
                 ),
             )
             text = (response.text or "").strip()
@@ -187,6 +204,75 @@ if st.session_state.get("_pending_outputs"):
     for _n, _t in st.session_state._pending_outputs.items():
         st.session_state[f"out_{_n}"] = _t
     st.session_state._pending_outputs = {}
+
+
+# ---------- 學生個人檔案 localStorage 持久化 ----------
+PROFILE_STORAGE_KEY = "student_profiles_v1"
+_profile_storage = LocalStorage() if LocalStorage else None
+
+
+def _load_profiles_from_browser() -> None:
+    """從 localStorage 讀取長期個人檔案並寫入 session_state（只做一次）。"""
+    if st.session_state.get("_profiles_loaded"):
+        return
+    if _profile_storage is None:
+        st.session_state._profiles_loaded = True
+        return
+    try:
+        raw = _profile_storage.getItem(PROFILE_STORAGE_KEY)
+    except Exception:
+        raw = None
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                for _stud, _prof in loaded.items():
+                    if isinstance(_prof, str) and f"profile_{_stud}" not in st.session_state:
+                        st.session_state[f"profile_{_stud}"] = _prof
+        except Exception:
+            pass
+    st.session_state._profiles_loaded = True
+
+
+def _save_profiles_to_browser() -> None:
+    """如果 profiles 有變動，寫回 localStorage。"""
+    if _profile_storage is None:
+        return
+    profiles: dict[str, str] = {}
+    for _stud in st.session_state.get("students", []):
+        _val = st.session_state.get(f"profile_{_stud}", "").strip()
+        if _val:
+            profiles[_stud] = _val
+    current_json = json.dumps(profiles, ensure_ascii=False, sort_keys=True)
+    if current_json != st.session_state.get("_last_saved_profiles_json"):
+        try:
+            _profile_storage.setItem(PROFILE_STORAGE_KEY, current_json)
+            st.session_state._last_saved_profiles_json = current_json
+        except Exception:
+            pass
+
+
+_load_profiles_from_browser()
+
+
+# ---------- 字元計數（用於長度顯示）----------
+def count_visible_chars(text: str) -> int:
+    """計算段落字數（去除空白與換行，中文字一字一字算）。"""
+    if not text:
+        return 0
+    return len(re.sub(r"\s+", "", text))
+
+
+def length_feedback(text: str, target: str) -> tuple[str, str]:
+    """回傳 (訊息, 樣式) 給字數顯示用。樣式是 'ok' / 'warn' / 'empty'。"""
+    count = count_visible_chars(text)
+    if count == 0:
+        return ("尚未產生", "empty")
+    low, high = LENGTH_RANGES[target]
+    if low <= count <= high:
+        return (f"✅ 目前 {count} 字（{target}長度目標 {low}–{high}）", "ok")
+    direction = "偏短" if count < low else "偏長"
+    return (f"⚠️ 目前 {count} 字｜{direction}（{target}長度目標 {low}–{high}）", "warn")
 
 
 def _load_default_api_key() -> str:
@@ -241,6 +327,28 @@ with st.sidebar:
     ]
     if parsed_students:
         st.session_state.students = parsed_students
+
+    st.divider()
+    with st.expander("📘 學生個人檔案（選填，長期特質）", expanded=False):
+        if _profile_storage is None:
+            st.caption(
+                "⚠️ 沒裝 streamlit-local-storage，檔案只會保留到本次 session。"
+                "重啟或重新整理後會消失。"
+            )
+        else:
+            st.caption(
+                "寫每位學生的**長期**特質（粗心、急性子、英文好等），"
+                "會自動套用到每次生成，幫 AI 更貼近個別學生。儲存在瀏覽器，"
+                "下次開啟仍在。不填也 OK。"
+            )
+        for _stud in st.session_state.students:
+            st.text_area(
+                f"📒 {_stud}",
+                key=f"profile_{_stud}",
+                height=75,
+                placeholder="例：粗心、寫得快、進位借位易錯、用嚴肅語氣會修正",
+            )
+    _save_profiles_to_browser()
 
 
 weekday = WEEKDAY_MAP[entry_date.weekday()]
@@ -330,6 +438,10 @@ for name in st.session_state.students:
             key=f"out_{name}",
             height=170,
         )
+        _current = st.session_state.get(f"out_{name}", "")
+        _target = st.session_state.get(f"len_{name}", "中")
+        _msg, _ = length_feedback(_current, _target)
+        st.caption(_msg)
 
 
 st.divider()
@@ -428,6 +540,10 @@ for name in st.session_state.students:
 final_text = "\n".join(lines)
 
 st.code(final_text or header, language="text")
+_total_chars = count_visible_chars(final_text) - count_visible_chars(header)
+_student_count = len(lines) - 1  # 扣掉標題行
+if _student_count > 0:
+    st.caption(f"📊 共 {_student_count} 位學生段落 ｜ 內文總字數 {_total_chars}")
 
 st.download_button(
     "💾 下載 .txt",
