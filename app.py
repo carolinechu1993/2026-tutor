@@ -38,7 +38,18 @@ except ImportError:
     LocalStorage = None  # type: ignore
 
 
-DEFAULT_STUDENTS = ["薛恩銘", "李妮綺", "潘奕亨", "蔡柏容", "張鈺淇"]
+DEFAULT_CLASSES = [
+    {
+        "name": "甲圍A班",
+        "students": ["薛恩銘", "李妮綺", "潘奕亨", "蔡柏容", "張鈺淇"],
+        "profiles": {},
+    },
+    {
+        "name": "獅湖A班",
+        "students": ["楊佩婕", "李妍柔", "王懷銘", "洪宇辰", "洪維謙"],
+        "profiles": {},
+    },
+]
 TAIPEI_TZ = ZoneInfo("Asia/Taipei") if ZoneInfo else None
 
 
@@ -215,17 +226,14 @@ if st.session_state.get("_pending_outputs"):
     st.session_state._pending_outputs = {}
 
 
-# ---------- localStorage 持久化 ----------
-# 兩把 key：設定（班級/前綴/模型/名單）與學生個人檔案分開存
-SETTINGS_STORAGE_KEY = "app_settings_v1"
-PROFILE_STORAGE_KEY = "student_profiles_v1"
+# ---------- localStorage 持久化（多班級）----------
+# 新格式：班級陣列（每班有自己的學生名單與個人檔案）+ 全域設定（前綴/模型/目前班級）
+CLASSES_STORAGE_KEY = "classes_v1"
+SETTINGS_STORAGE_KEY = "app_settings_v2"
+# v1 舊格式（僅用於遷移）：單一班級設定 + 扁平學生個人檔案
+LEGACY_SETTINGS_KEY = "app_settings_v1"
+LEGACY_PROFILES_KEY = "student_profiles_v1"
 _storage = LocalStorage() if LocalStorage else None
-
-DEFAULT_SETTINGS = {
-    "class_name": "甲圍A班",
-    "prefix": "😊",
-    "model": MODEL_OPTIONS[0],
-}
 
 
 def _apply_pending_widget_updates() -> None:
@@ -238,25 +246,141 @@ def _apply_pending_widget_updates() -> None:
         st.session_state._pending_widget_state = {}
 
 
+def _normalize_class(raw: object) -> dict | None:
+    """驗證並正規化單一班級 dict，無效就回傳 None。"""
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    students_raw = raw.get("students")
+    profiles_raw = raw.get("profiles", {})
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(students_raw, list):
+        return None
+    students = [s.strip() for s in students_raw if isinstance(s, str) and s.strip()]
+    if not students:
+        return None
+    profiles: dict[str, str] = {}
+    if isinstance(profiles_raw, dict):
+        for k, v in profiles_raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                profiles[k] = v
+    return {"name": name.strip(), "students": students, "profiles": profiles}
+
+
+def _default_classes_copy() -> list[dict]:
+    return [
+        {"name": c["name"], "students": c["students"].copy(), "profiles": {}}
+        for c in DEFAULT_CLASSES
+    ]
+
+
+def _load_classes() -> None:
+    """把班級陣列載入 session_state.classes，必要時從 v1 舊格式遷移。"""
+    if st.session_state.get("_classes_loaded"):
+        return
+
+    classes: list[dict] | None = None
+    if _storage is not None:
+        try:
+            raw = _storage.getItem(CLASSES_STORAGE_KEY)
+        except Exception:
+            raw = None
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, list):
+                    normalized = [c for c in (_normalize_class(x) for x in loaded) if c]
+                    if normalized:
+                        classes = normalized
+            except Exception:
+                pass
+
+        # 沒有新格式 → 嘗試從 v1 遷移
+        if classes is None:
+            try:
+                old_settings_raw = _storage.getItem(LEGACY_SETTINGS_KEY)
+            except Exception:
+                old_settings_raw = None
+            try:
+                old_profiles_raw = _storage.getItem(LEGACY_PROFILES_KEY)
+            except Exception:
+                old_profiles_raw = None
+
+            if old_settings_raw:
+                try:
+                    old = json.loads(old_settings_raw)
+                except Exception:
+                    old = None
+                old_profiles: dict[str, str] = {}
+                if old_profiles_raw:
+                    try:
+                        op = json.loads(old_profiles_raw)
+                        if isinstance(op, dict):
+                            old_profiles = {
+                                k: v
+                                for k, v in op.items()
+                                if isinstance(k, str) and isinstance(v, str)
+                            }
+                    except Exception:
+                        pass
+                if isinstance(old, dict):
+                    first = _normalize_class(
+                        {
+                            "name": old.get("class_name")
+                            or DEFAULT_CLASSES[0]["name"],
+                            "students": old.get("students")
+                            or DEFAULT_CLASSES[0]["students"],
+                            "profiles": old_profiles,
+                        }
+                    )
+                    if first:
+                        classes = [first]
+                        # 補上獅湖A班當第二個班（除非第一個班剛好同名）
+                        second = DEFAULT_CLASSES[1]
+                        if first["name"] != second["name"]:
+                            classes.append(
+                                {
+                                    "name": second["name"],
+                                    "students": second["students"].copy(),
+                                    "profiles": {},
+                                }
+                            )
+
+    if not classes:
+        classes = _default_classes_copy()
+
+    st.session_state.classes = classes
+    st.session_state._classes_loaded = True
+
+
+def _save_classes_to_browser() -> None:
+    if _storage is None:
+        return
+    classes = st.session_state.get("classes", [])
+    current_json = json.dumps(classes, ensure_ascii=False, sort_keys=True)
+    if current_json != st.session_state.get("_last_saved_classes_json"):
+        try:
+            _storage.setItem(CLASSES_STORAGE_KEY, current_json)
+            st.session_state._last_saved_classes_json = current_json
+        except Exception:
+            pass
+
+
 def _load_settings_from_browser() -> None:
-    """從 localStorage 讀取 4 項設定。只做一次。讀不到就用預設。"""
+    """讀取前綴／模型／目前班級索引（v2；若無則從 v1 取前綴與模型）。"""
     if st.session_state.get("_settings_loaded"):
         return
 
-    # 1. 先鋪預設值（確保 session_state 不管怎樣都有值）
-    if "class_name_input" not in st.session_state:
-        st.session_state.class_name_input = DEFAULT_SETTINGS["class_name"]
     if "prefix_input" not in st.session_state:
-        st.session_state.prefix_input = DEFAULT_SETTINGS["prefix"]
+        st.session_state.prefix_input = "😊"
     if "model_select" not in st.session_state:
-        st.session_state.model_select = DEFAULT_SETTINGS["model"]
-    if "students_text_area" not in st.session_state:
-        st.session_state.students_text_area = "\n".join(DEFAULT_STUDENTS)
-    if "students" not in st.session_state:
-        st.session_state.students = DEFAULT_STUDENTS.copy()
+        st.session_state.model_select = MODEL_OPTIONS[0]
+    if "active_class_index" not in st.session_state:
+        st.session_state.active_class_index = 0
 
-    # 2. 從 localStorage 覆蓋（若有）
     if _storage is not None:
+        raw = None
         try:
             raw = _storage.getItem(SETTINGS_STORAGE_KEY)
         except Exception:
@@ -265,41 +389,46 @@ def _load_settings_from_browser() -> None:
             try:
                 loaded = json.loads(raw)
                 if isinstance(loaded, dict):
-                    if isinstance(loaded.get("class_name"), str):
-                        st.session_state.class_name_input = loaded["class_name"]
                     if isinstance(loaded.get("prefix"), str) and loaded["prefix"]:
                         st.session_state.prefix_input = loaded["prefix"]
                     if loaded.get("model") in MODEL_OPTIONS:
                         st.session_state.model_select = loaded["model"]
-                    if isinstance(loaded.get("students"), list):
-                        students = [
-                            s.strip()
-                            for s in loaded["students"]
-                            if isinstance(s, str) and s.strip()
+                    if isinstance(loaded.get("active_class_index"), int):
+                        st.session_state.active_class_index = loaded[
+                            "active_class_index"
                         ]
-                        if students:
-                            st.session_state.students_text_area = "\n".join(students)
-                            st.session_state.students = students
             except Exception:
                 pass
+        else:
+            # 沒有 v2 → 從 v1 settings 撈前綴／模型（班級已於 _load_classes 遷移）
+            try:
+                raw = _storage.getItem(LEGACY_SETTINGS_KEY)
+            except Exception:
+                raw = None
+            if raw:
+                try:
+                    loaded = json.loads(raw)
+                    if isinstance(loaded, dict):
+                        if isinstance(loaded.get("prefix"), str) and loaded["prefix"]:
+                            st.session_state.prefix_input = loaded["prefix"]
+                        if loaded.get("model") in MODEL_OPTIONS:
+                            st.session_state.model_select = loaded["model"]
+                except Exception:
+                    pass
+
+    n = len(st.session_state.get("classes", []))
+    if not (0 <= st.session_state.active_class_index < n):
+        st.session_state.active_class_index = 0
     st.session_state._settings_loaded = True
 
 
 def _save_settings_to_browser() -> None:
-    """設定有變動就寫回 localStorage。"""
     if _storage is None:
         return
     settings = {
-        "class_name": st.session_state.get(
-            "class_name_input", DEFAULT_SETTINGS["class_name"]
-        ),
-        "prefix": st.session_state.get("prefix_input", DEFAULT_SETTINGS["prefix"]),
-        "model": st.session_state.get("model_select", DEFAULT_SETTINGS["model"]),
-        "students": [
-            s.strip()
-            for s in st.session_state.get("students_text_area", "").splitlines()
-            if s.strip()
-        ],
+        "prefix": st.session_state.get("prefix_input", "😊"),
+        "model": st.session_state.get("model_select", MODEL_OPTIONS[0]),
+        "active_class_index": st.session_state.get("active_class_index", 0),
     }
     current_json = json.dumps(settings, ensure_ascii=False, sort_keys=True)
     if current_json != st.session_state.get("_last_saved_settings_json"):
@@ -310,53 +439,105 @@ def _save_settings_to_browser() -> None:
             pass
 
 
-def _load_profiles_from_browser() -> None:
-    """從 localStorage 讀取學生個人檔案。只做一次。"""
-    if st.session_state.get("_profiles_loaded"):
-        return
-    if _storage is None:
-        st.session_state._profiles_loaded = True
-        return
-    try:
-        raw = _storage.getItem(PROFILE_STORAGE_KEY)
-    except Exception:
-        raw = None
-    if raw:
-        try:
-            loaded = json.loads(raw)
-            if isinstance(loaded, dict):
-                for _stud, _prof in loaded.items():
-                    if (
-                        isinstance(_prof, str)
-                        and f"profile_{_stud}" not in st.session_state
-                    ):
-                        st.session_state[f"profile_{_stud}"] = _prof
-        except Exception:
-            pass
-    st.session_state._profiles_loaded = True
+def _active_class() -> dict:
+    classes = st.session_state.classes
+    idx = st.session_state.active_class_index
+    return classes[idx]
 
 
-def _save_profiles_to_browser() -> None:
-    """個人檔案有變動就寫回 localStorage。"""
-    if _storage is None:
+def _init_active_class_widgets() -> None:
+    """首次載入時把目前班級的資料鋪進側邊欄 widget key。"""
+    if st.session_state.get("_class_widgets_initialized"):
         return
+    cls = _active_class()
+    if "students_text_area" not in st.session_state:
+        st.session_state.students_text_area = "\n".join(cls["students"])
+    if "class_name_input" not in st.session_state:
+        st.session_state.class_name_input = cls["name"]
+    if "students" not in st.session_state:
+        st.session_state.students = cls["students"].copy()
+    for stud in cls["students"]:
+        if f"profile_{stud}" not in st.session_state:
+            st.session_state[f"profile_{stud}"] = cls["profiles"].get(stud, "")
+    st.session_state._class_widgets_initialized = True
+
+
+def _sync_widgets_to_class(idx: int) -> None:
+    """把目前側邊欄 widget 的值寫回 classes[idx]。"""
+    classes = st.session_state.get("classes", [])
+    if not (0 <= idx < len(classes)):
+        return
+    cls = classes[idx]
+    txt = st.session_state.get("students_text_area", "")
+    students = [s.strip() for s in txt.splitlines() if s.strip()]
+    if students:
+        cls["students"] = students
+    name = (st.session_state.get("class_name_input", "") or "").strip()
+    if name:
+        cls["name"] = name
     profiles: dict[str, str] = {}
-    for _stud in st.session_state.get("students", []):
-        _val = st.session_state.get(f"profile_{_stud}", "").strip()
-        if _val:
-            profiles[_stud] = _val
-    current_json = json.dumps(profiles, ensure_ascii=False, sort_keys=True)
-    if current_json != st.session_state.get("_last_saved_profiles_json"):
-        try:
-            _storage.setItem(PROFILE_STORAGE_KEY, current_json)
-            st.session_state._last_saved_profiles_json = current_json
-        except Exception:
-            pass
+    for stud in cls["students"]:
+        val = (st.session_state.get(f"profile_{stud}", "") or "").strip()
+        if val:
+            profiles[stud] = val
+    cls["profiles"] = profiles
+
+
+def _load_class_into_widgets(idx: int) -> None:
+    """把 classes[idx] 的資料寫入 widget key，讓下一輪 rerun 顯示該班內容。"""
+    classes = st.session_state.classes
+    if not (0 <= idx < len(classes)):
+        return
+    cls = classes[idx]
+    st.session_state.students_text_area = "\n".join(cls["students"])
+    st.session_state.class_name_input = cls["name"]
+    st.session_state.students = cls["students"].copy()
+    for stud in cls["students"]:
+        st.session_state[f"profile_{stud}"] = cls["profiles"].get(stud, "")
+
+
+def _on_class_picker_change() -> None:
+    new_idx = st.session_state.class_picker
+    old_idx = st.session_state.get("active_class_index", 0)
+    if new_idx == old_idx:
+        return
+    _sync_widgets_to_class(old_idx)
+    _load_class_into_widgets(new_idx)
+    st.session_state.active_class_index = new_idx
+
+
+def _on_add_class_click() -> None:
+    _sync_widgets_to_class(st.session_state.active_class_index)
+    # 取一個不重複的新班級名
+    existing = {c["name"] for c in st.session_state.classes}
+    base = "新班級"
+    new_name = base
+    i = 2
+    while new_name in existing:
+        new_name = f"{base}{i}"
+        i += 1
+    new_cls = {"name": new_name, "students": ["學生1"], "profiles": {}}
+    st.session_state.classes.append(new_cls)
+    new_idx = len(st.session_state.classes) - 1
+    _load_class_into_widgets(new_idx)
+    st.session_state.active_class_index = new_idx
+
+
+def _on_delete_class_click() -> None:
+    classes = st.session_state.classes
+    if len(classes) <= 1:
+        return
+    idx = st.session_state.active_class_index
+    classes.pop(idx)
+    new_idx = min(idx, len(classes) - 1)
+    _load_class_into_widgets(new_idx)
+    st.session_state.active_class_index = new_idx
 
 
 _apply_pending_widget_updates()
+_load_classes()
 _load_settings_from_browser()
-_load_profiles_from_browser()
+_init_active_class_widgets()
 
 
 # ---------- 字元計數（用於長度顯示）----------
@@ -417,8 +598,48 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("📚 班級")
+    # 渲染前先把上一輪的 widget 值同步回 classes dict，
+    # 確保下方班級選單的名稱是最新的（用戶剛改完班級名的那次 rerun 也能即時顯示）
+    _sync_widgets_to_class(st.session_state.active_class_index)
+    classes_list = st.session_state.classes
+    active_idx = st.session_state.active_class_index
+    if not (0 <= active_idx < len(classes_list)):
+        active_idx = 0
+        st.session_state.active_class_index = 0
+    st.selectbox(
+        "目前班級",
+        options=list(range(len(classes_list))),
+        format_func=lambda i: classes_list[i]["name"],
+        index=active_idx,
+        key="class_picker",
+        on_change=_on_class_picker_change,
+        help="切換後，下方「班級名稱」「學生名單」「個人檔案」會載入該班資料。",
+    )
+    _c_add, _c_del = st.columns(2)
+    with _c_add:
+        st.button(
+            "➕ 新增班級",
+            use_container_width=True,
+            on_click=_on_add_class_click,
+            help="會新增一個空白班級並切換過去，再到下方改名字、編輯學生名單。",
+        )
+    with _c_del:
+        st.button(
+            "🗑️ 刪除此班級",
+            use_container_width=True,
+            on_click=_on_delete_class_click,
+            disabled=len(classes_list) <= 1,
+            help="只保留一個班時不能刪除。刪除後無法復原。",
+        )
+
+    st.divider()
     st.subheader("📅 班級 / 日期")
-    class_name = st.text_input("班級名稱", key="class_name_input")
+    class_name = st.text_input(
+        "班級名稱",
+        key="class_name_input",
+        help="修改後會自動存到目前班級。",
+    )
     entry_date = st.date_input("日期", value=today_in_taipei())
     prefix = st.text_input(
         "段落前綴（例如 😊 或 @）", key="prefix_input", max_chars=4
@@ -426,7 +647,10 @@ with st.sidebar:
 
     st.divider()
     st.subheader("👥 學生名單")
-    st.caption("每行一位。直接編輯：刪一行 = 刪學生；加一行 = 加新學生。")
+    st.caption(
+        f"目前是「{classes_list[active_idx]['name']}」。每行一位，"
+        "刪一行 = 刪學生、加一行 = 加新學生。"
+    )
     st.text_area(
         "學生名單（每行一位）",
         key="students_text_area",
@@ -438,13 +662,6 @@ with st.sidebar:
     ]
     if parsed_students:
         st.session_state.students = parsed_students
-    if st.button("↩️ 還原預設學生名單", use_container_width=True):
-        # 用 pending 機制更新 widget key，繞開「widget 已實例化後不能改」的錯誤
-        st.session_state._pending_widget_state = {
-            "students_text_area": "\n".join(DEFAULT_STUDENTS),
-        }
-        st.session_state.students = DEFAULT_STUDENTS.copy()
-        st.rerun()
 
     st.divider()
     with st.expander("📘 學生個人檔案（選填，長期特質）", expanded=False):
@@ -456,17 +673,22 @@ with st.sidebar:
         else:
             st.caption(
                 "寫每位學生的**長期**特質（粗心、急性子、英文好等），"
-                "會自動套用到每次生成，幫 AI 更貼近個別學生。儲存在瀏覽器，"
-                "下次開啟仍在。不填也 OK。"
+                "會自動套用到每次生成。每個班各自儲存，切班不互相干擾。"
             )
+        _active_profiles = classes_list[active_idx].get("profiles", {})
         for _stud in st.session_state.students:
+            # 剛加入的新學生，widget key 可能還沒初始化 → 先用該班檔案內的資料鋪底
+            if f"profile_{_stud}" not in st.session_state:
+                st.session_state[f"profile_{_stud}"] = _active_profiles.get(_stud, "")
             st.text_area(
                 f"📒 {_stud}",
                 key=f"profile_{_stud}",
                 height=75,
                 placeholder="例：粗心、寫得快、進位借位易錯、用嚴肅語氣會修正",
             )
-    _save_profiles_to_browser()
+    # 側邊欄結束前再同步一次，確保使用者剛打的內容會進 classes dict 並存到 localStorage
+    _sync_widgets_to_class(st.session_state.active_class_index)
+    _save_classes_to_browser()
     _save_settings_to_browser()
 
 
