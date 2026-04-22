@@ -57,26 +57,47 @@ SYSTEM_PROMPT = f"""你是細心的國小課輔老師，每天課後要為每位
 - 描述要具體：提到單元或題型名稱（例如「魔數大戰」「量角器」「7-4 角與角度」「尾數是 0 的除法」「被除數／除數」等），描述學生的實際反應、老師怎麼引導、結果如何。
 - 兼顧正向肯定與誠實指出問題，可以帶入情緒觀察（例如：不耐煩、自信、分心、洋洋灑灑地寫、粗心大意）。
 - 語氣溫和但具體，避免制式評語堆砌（不要「很棒很用心」這種空話）。
-- 段落長度依使用者指定。
+
+**字數控制（重要）**：
+- 中文字以一個字為單位（標點符號不算）。
+- 寫完後必須自我檢查字數，超過上限就精簡重寫、少於下限就補充細節，**嚴格遵守使用者指定的範圍**。
 
 {FEW_SHOT_EXAMPLES}
 
 請模仿上述語氣，但**不要直接抄範例的內容或題目**，只根據使用者提供的關鍵字撰寫。"""
 
 
+FIELD_LABELS = [
+    ("progress", "今日進度／單元"),
+    ("performance", "表現與錯題"),
+    ("attitude", "態度觀察"),
+    ("extra", "其他備註"),
+]
+
+
+def assemble_notes(name: str) -> str:
+    """把 4 個欄位組成帶標籤的關鍵字字串餵給模型。"""
+    lines: list[str] = []
+    for key, label in FIELD_LABELS:
+        val = st.session_state.get(f"{key}_{name}", "").strip()
+        if val:
+            lines.append(f"【{label}】{val}")
+    return "\n".join(lines)
+
+
 def build_user_prompt(name: str, notes: str, length: str) -> str:
     length_hint = {
-        "短": "約 50–80 字",
-        "中": "約 80–140 字",
-        "長": "約 140–220 字",
+        "短": "約 75 字（允許範圍 65–90 字）",
+        "中": "約 110 字（允許範圍 95–125 字）",
+        "長": "約 170 字（允許範圍 150–190 字）",
     }[length]
     return (
         f"請為學生「{name}」撰寫今日課程交接段落。\n\n"
-        f"今日觀察關鍵字／短句：\n{notes.strip()}\n\n"
+        f"今日觀察關鍵字／短句（依欄位分類）：\n{notes.strip()}\n\n"
         f"要求：\n"
-        f"- 長度：{length_hint}\n"
-        f"- 直接輸出段落內文，不要加姓名前綴、不要加標題、不要加引號\n"
-        f"- 只輸出一段文字"
+        f"- 長度：{length_hint}。請務必在此範圍內，超過或不足都要修正。\n"
+        f"- 直接輸出段落內文，不要加姓名前綴、不要加標題、不要加引號、不要加字數統計。\n"
+        f"- 只輸出一段文字。"
     )
 
 
@@ -159,6 +180,14 @@ if "students" not in st.session_state:
 if "students_text_area" not in st.session_state:
     st.session_state.students_text_area = "\n".join(DEFAULT_STUDENTS)
 
+# 在任何 widget 渲染前，套用上一輪 rerun 前暫存的輸出值。
+# 這是為了繞開 Streamlit「widget instantiated 之後不能改 session_state」的限制，
+# 讓「一鍵產生全部」「清空全部」等批次動作能安全更新 text_area 的內容。
+if st.session_state.get("_pending_outputs"):
+    for _n, _t in st.session_state._pending_outputs.items():
+        st.session_state[f"out_{_n}"] = _t
+    st.session_state._pending_outputs = {}
+
 
 def _load_default_api_key() -> str:
     try:
@@ -227,18 +256,33 @@ for name in st.session_state.students:
     with st.expander(f"😊 {name}", expanded=True):
         left, right = st.columns([3, 2])
         with left:
-            st.text_area(
-                "今日重點（關鍵字或短句，逗號／換行分隔皆可）",
-                key=f"notes_{name}",
-                height=140,
-                placeholder=(
-                    "例：\n"
-                    "・7-4 角與角度完成\n"
-                    "・量角器使用正確\n"
-                    "・7-3 寫太快錯兩題（減錯）\n"
-                    "・觀察是急著完成，需要加強"
-                ),
-            )
+            la, lb = st.columns(2)
+            with la:
+                st.text_area(
+                    "今日進度／單元",
+                    key=f"progress_{name}",
+                    height=100,
+                    placeholder="例：\n7-4 角與角度\n整數(九)乘法\n魔數大戰 99/100",
+                )
+                st.text_area(
+                    "表現與錯題",
+                    key=f"performance_{name}",
+                    height=120,
+                    placeholder="例：\n量角器使用正確\n7-3 計算錯 2 題（減錯）\n分數乘除不太會",
+                )
+            with lb:
+                st.text_area(
+                    "態度觀察",
+                    key=f"attitude_{name}",
+                    height=100,
+                    placeholder="例：\n急著完成、粗心\n配合度高\n洋洋灑灑寫到底",
+                )
+                st.text_area(
+                    "其他備註（選填）",
+                    key=f"extra_{name}",
+                    height=120,
+                    placeholder="例：\n聯絡簿 16:10 前交\n上次作業偷寫\n家長 17:40 會來接",
+                )
         with right:
             st.select_slider(
                 "段落長度",
@@ -257,12 +301,12 @@ for name in st.session_state.students:
 
         should_generate = gen_clicked or regen_clicked
         if should_generate:
-            notes_val = st.session_state.get(f"notes_{name}", "")
+            notes_val = assemble_notes(name)
             length_val = st.session_state.get(f"len_{name}", "中")
             if not client:
                 st.error("請先在左側填入 Gemini API Key")
             elif not notes_val.strip():
-                st.warning("請先輸入今日重點")
+                st.warning("請至少填寫一個欄位")
             else:
                 with st.spinner(f"為 {name} 產生段落中..."):
                     try:
@@ -295,24 +339,37 @@ if bulk_clicked:
     else:
         prog = st.progress(0.0, text="準備中...")
         total = len(st.session_state.students)
+        pending: dict[str, str] = {}
+        failures: list[str] = []
         for i, name in enumerate(st.session_state.students):
-            notes_val = st.session_state.get(f"notes_{name}", "")
+            notes_val = assemble_notes(name)
             length_val = st.session_state.get(f"len_{name}", "中")
             prog.progress(i / max(total, 1), text=f"產生 {name} 中...")
             if not notes_val.strip():
                 continue
             try:
-                para = generate_paragraph(client, model, name, notes_val, length_val)
-                st.session_state[f"out_{name}"] = para
+                pending[name] = generate_paragraph(
+                    client, model, name, notes_val, length_val
+                )
             except Exception as exc:  # noqa: BLE001
-                st.warning(f"{name} 產生失敗：{exc}")
+                failures.append(f"{name}：{exc}")
         prog.progress(1.0, text="完成")
+        st.session_state._pending_outputs = pending
+        if failures:
+            st.session_state._pending_failures = failures
         st.rerun()
 
 if clear_clicked:
-    for name in st.session_state.students:
-        st.session_state[f"out_{name}"] = ""
+    st.session_state._pending_outputs = {
+        name: "" for name in st.session_state.students
+    }
     st.rerun()
+
+# 顯示上一輪批次產生的失敗訊息（如果有）
+if st.session_state.get("_pending_failures"):
+    for msg in st.session_state._pending_failures:
+        st.warning(msg)
+    st.session_state._pending_failures = []
 
 
 st.divider()
