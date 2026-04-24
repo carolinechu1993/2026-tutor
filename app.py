@@ -43,14 +43,64 @@ DEFAULT_CLASSES = [
         "name": "甲圍A班",
         "students": ["薛恩銘", "李妮綺", "潘奕亨", "蔡柏容", "張鈺淇"],
         "profiles": {},
+        "social_worker": "",
+        "subject": "",
+        "textbook_template": "",
     },
     {
         "name": "獅湖A班",
         "students": ["楊佩婕", "李妍柔", "王懷銘", "洪宇辰", "洪維謙"],
         "profiles": {},
+        "social_worker": "",
+        "subject": "",
+        "textbook_template": "",
     },
 ]
 TAIPEI_TZ = ZoneInfo("Asia/Taipei") if ZoneInfo else None
+
+# 學期末交接表（獅湖國小）相關常數
+SEMESTER_FORM_ID = "1FAIpQLSdr6_EapIcZn_qHIla-83FaD2vIpO6Iv-_7lXLzkOgfyYYSPA"
+SOCIAL_WORKER_OPTIONS = ["", "謝秀玉", "賴姿岑", "曾巧怡"]
+SUBJECT_OPTIONS = ["", "英文", "國語", "數學"]
+# 10 題的內部 key（order matters：用於顯示、預填對應）
+FORM_FIELD_KEYS = [
+    "social_worker",         # Q1 主責社工
+    "class_name",            # Q2 負責班級
+    "teacher_name",          # Q3 課輔老師姓名
+    "subject",               # Q4 負責科目
+    "student_name",          # Q5 學童姓名
+    "remedial_units",        # Q6 下學期需補考單元
+    "next_start_unit",       # Q7 下學期起始單元
+    "learning_performance",  # Q8 學習表現 & 教學方式
+    "behavior_emotion",      # Q9 行為情緒 & 處理方式
+    "textbook",              # Q10 欲領取新課本
+]
+# 「取得預填連結」時使用者要在每題填入的識別字串（Q1、Q4 是下拉，用選項實值）
+FORM_FIELD_MARKERS = {
+    "social_worker": "謝秀玉",          # Q1：測試時請選「謝秀玉」
+    "class_name": "MARK_CLASS",
+    "teacher_name": "MARK_TEACHER",
+    "subject": "數學",                   # Q4：測試時請選「數學」
+    "student_name": "MARK_STUDENT",
+    "remedial_units": "MARK_REMEDIAL",
+    "next_start_unit": "MARK_NEXT_UNIT",
+    "learning_performance": "MARK_LEARNING",
+    "behavior_emotion": "MARK_BEHAVIOR",
+    "textbook": "MARK_TEXTBOOK",
+}
+# 顯示用標籤
+FORM_FIELD_LABELS = {
+    "social_worker": "Q1 主責社工",
+    "class_name": "Q2 負責班級",
+    "teacher_name": "Q3 課輔老師姓名",
+    "subject": "Q4 負責科目",
+    "student_name": "Q5 學童姓名",
+    "remedial_units": "Q6 下學期需補考單元",
+    "next_start_unit": "Q7 下學期起始單元",
+    "learning_performance": "Q8 學習表現 & 教學方式",
+    "behavior_emotion": "Q9 行為情緒 & 處理方式",
+    "textbook": "Q10 欲領取新課本",
+}
 
 
 def today_in_taipei() -> date:
@@ -215,6 +265,191 @@ def generate_paragraph(
     )
 
 
+# ---------- 學期末交接表：每日紀錄解析 / AI 摘要 / 預填 URL ----------
+
+# 日期標頭範例：「4/20（週一）獅湖A班課程交接」或「4/20（一）甲圍A班課程交接」。
+# 括號內只要非「）」字元都允許（一／ㄧ／週一／weekday 數字都可能出現）。
+_DATE_HEADER_RE = re.compile(
+    r"^\s*(\d{1,2}/\d{1,2})\s*[（(][^)）]+[）)]\s*(.+?)\s*課程交接\s*$"
+)
+# 學生段落行：任意 emoji 或 @ 當前綴 + 學生名 + 「：」+ 段落。
+# 名字允許中英文與數字，但不含全形冒號、emoji、空白。
+_STUDENT_LINE_RE = re.compile(
+    r"^\s*(?:[^\w\s：:]+|@)\s*([\w一-鿿]{1,10})\s*[:：]\s*(.+?)\s*$"
+)
+
+
+def parse_semester_records(
+    text: str, known_students: list[str] | None = None
+) -> dict[str, list[tuple[str, str]]]:
+    """解析貼入的整學期紀錄成 {student_name: [(date_str, paragraph), ...]}。
+
+    - 支援 app 產出的標準格式（日期標頭 + 😊學生：段落）。
+    - `known_students` 若提供，用於驗證並過濾雜訊（只收錄名單內學生）；
+      不提供時任何符合格式的學生行都會被收錄。
+    """
+    if not text or not text.strip():
+        return {}
+    allowed = set(known_students) if known_students else None
+    result: dict[str, list[tuple[str, str]]] = {}
+    current_date = ""
+    # 合併連續段落到同一學生（段落可能換行）——但保守起見，我們假設每位
+    # 學生一行（app 本身就是這樣輸出）。若使用者手動編輯換行，超過一行的
+    # 段落會被截斷在該行；先接受這個限制。
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        m_date = _DATE_HEADER_RE.match(line)
+        if m_date:
+            current_date = m_date.group(1)
+            continue
+        m_stud = _STUDENT_LINE_RE.match(line)
+        if m_stud:
+            name = m_stud.group(1).strip()
+            para = m_stud.group(2).strip()
+            if allowed is not None and name not in allowed:
+                continue
+            if not para:
+                continue
+            result.setdefault(name, []).append((current_date, para))
+    return result
+
+
+def _extract_entry_ids_from_prefill_url(
+    url: str, markers: dict[str, str]
+) -> dict[str, str]:
+    """從 Google Form 的「取得預填連結」URL 抽取 entry.XXX 與題目的對應。
+
+    做法：URL 裡每個 `entry.NNNN=<value>` 的 value 會跟 markers[field]
+    比對，若 URL-decode 後相等就把該 entry ID 對到該欄位。
+
+    回傳只包含成功對應到的欄位。
+    """
+    if not url or not url.strip():
+        return {}
+    try:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    except Exception:
+        return {}
+    found: dict[str, str] = {}
+    for key, value in params:
+        if not key.startswith("entry."):
+            continue
+        for field_key, marker in markers.items():
+            if field_key in found:
+                continue
+            if value == marker:
+                found[field_key] = key
+                break
+    return found
+
+
+def build_prefill_url(
+    form_id: str, entry_ids: dict[str, str], answers: dict[str, str]
+) -> str:
+    """用 entry ID 對應表 + 答案字典產生 Google Form 的預填連結。"""
+    base = f"https://docs.google.com/forms/d/e/{form_id}/viewform"
+    parts: list[tuple[str, str]] = [("usp", "pp_url")]
+    for field_key, entry_id in entry_ids.items():
+        ans = answers.get(field_key, "")
+        if ans is None:
+            ans = ""
+        parts.append((entry_id, str(ans)))
+    query = urllib.parse.urlencode(parts)
+    return f"{base}?{query}"
+
+
+SEMESTER_SUMMARY_SYSTEM_PROMPT = """你是細心的國小課輔老師。現在是學期末，你要為某位學生填寫「學童交接表」給下學期的老師看，根據該生整學期的每日課程交接紀錄做摘要。
+
+**表單四題的寫作風格（Q8、Q9 官方範例）**：
+Q8 學習表現&有效教學方式範例：
+1. OO學習理解能力很好，但學習成效要看他是否能專注，狀況不佳時，預定的進度會無法完成學習。
+2. 期中發現OO九九乘法表仍未精熟，雖然不會背錯，但每次解題都要從該數的1倍開始依序背到所需的，自然就會影響解題速度。
+
+Q9 行為情緒&有效處理方式範例：
+1. OO上課容易分心，會發呆或是把玩物品，老師可以一開始就要求孩子桌面只留下一枝鉛筆及橡皮擦，其他物品收起來，放空部分則可以經常點OO回答問題，讓他保持專注。
+2. OO也是個直爽的孩子，因此有任何情緒都會直接告訴老師，只要根據當下的情況處理後，OO就會放下情緒了。
+
+**你的輸出格式**（嚴格 JSON，不要加 markdown code fence、不要加額外說明）：
+{
+  "Q6": "此學期已檢測但未通過之單元，格式如 5-2、5-4；若沒有或非數學科請填「無」",
+  "Q7": "下學期起始單元，格式如 5-3、5-5 或 第一冊Ch4；抓紀錄中「最後在上／最新提到」的單元",
+  "Q8": "學習表現需加強/改善的部分 + 對此學生有效的教學方式。300–500 字。要具體，舉紀錄中實際發生的事件或單元名稱。",
+  "Q9": "行為情緒表現 + 對此學生有效的處理方式。300–500 字。要具體。"
+}
+
+**重要**：
+- Q8、Q9 必須從紀錄整理歸納，不得捏造；若紀錄資訊不足，就用較短但誠實的篇幅描述。
+- Q8、Q9 可以用學生名字代替「OO」，也可以保留「OO」；請自然書寫。
+- Q6 僅當科目為數學時有意義；其他科目一律填「無」。
+- Q7 若紀錄中看不出未來單元，就填最後提到的單元；看不出任何單元就填「無」。
+"""
+
+
+def build_semester_summary(
+    client,
+    model: str,
+    student_name: str,
+    records: list[tuple[str, str]],
+    subject: str,
+) -> dict[str, str]:
+    """把某學生整學期段落送給 Gemini，回傳 Q6/Q7/Q8/Q9 四個答案。
+
+    失敗會直接 raise（交由呼叫端顯示錯誤訊息）。
+    """
+    if not records:
+        raise ValueError(f"{student_name} 沒有任何紀錄可分析。")
+    joined = "\n\n".join(
+        f"【{date or '(無日期)'}】{para}" for date, para in records
+    )
+    subject_line = subject.strip() or "（未指定，請當作一般科目處理，Q6 填「無」）"
+    user_prompt = (
+        f"學生姓名：{student_name}\n"
+        f"科目：{subject_line}\n\n"
+        f"該生本學期每日課程交接紀錄（共 {len(records)} 筆）：\n"
+        f"{joined}\n\n"
+        f"請依上述系統指示，輸出嚴格 JSON 物件，包含 Q6、Q7、Q8、Q9 四個欄位。"
+    )
+    models_to_try = FALLBACK_CHAIN.get(model, [model])
+    last_exc: Exception | None = None
+    for candidate in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=candidate,
+                contents=user_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SEMESTER_SUMMARY_SYSTEM_PROMPT,
+                    max_output_tokens=2000,
+                    temperature=0.6,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = (response.text or "").strip()
+            if not text:
+                raise RuntimeError("Gemini 回傳空內容，可能被安全過濾器擋下。")
+            data = json.loads(text)
+            out = {
+                "Q6": str(data.get("Q6", "")).strip(),
+                "Q7": str(data.get("Q7", "")).strip(),
+                "Q8": str(data.get("Q8", "")).strip(),
+                "Q9": str(data.get("Q9", "")).strip(),
+            }
+            # 非數學科一律 Q6 = 無（保險起見再覆寫一次）
+            if subject.strip() and subject.strip() != "數學":
+                out["Q6"] = "無"
+            return out
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _is_transient(exc):
+                continue
+            raise
+    raise RuntimeError(
+        f"所有 Gemini 備援模型目前都在過載中。請稍等再試。\n\n{last_exc}"
+    )
+
+
 st.set_page_config(page_title="課輔交接產生器", page_icon="📝", layout="wide")
 
 # 在任何 widget 渲染前，套用上一輪 rerun 前暫存的輸出值。
@@ -265,12 +500,36 @@ def _normalize_class(raw: object) -> dict | None:
         for k, v in profiles_raw.items():
             if isinstance(k, str) and isinstance(v, str):
                 profiles[k] = v
-    return {"name": name.strip(), "students": students, "profiles": profiles}
+
+    def _str_field(key: str, allowed: list[str] | None = None) -> str:
+        val = raw.get(key, "")
+        if not isinstance(val, str):
+            return ""
+        val = val.strip()
+        if allowed is not None and val and val not in allowed:
+            return ""
+        return val
+
+    return {
+        "name": name.strip(),
+        "students": students,
+        "profiles": profiles,
+        "social_worker": _str_field("social_worker", SOCIAL_WORKER_OPTIONS),
+        "subject": _str_field("subject", SUBJECT_OPTIONS),
+        "textbook_template": _str_field("textbook_template"),
+    }
 
 
 def _default_classes_copy() -> list[dict]:
     return [
-        {"name": c["name"], "students": c["students"].copy(), "profiles": {}}
+        {
+            "name": c["name"],
+            "students": c["students"].copy(),
+            "profiles": {},
+            "social_worker": c.get("social_worker", ""),
+            "subject": c.get("subject", ""),
+            "textbook_template": c.get("textbook_template", ""),
+        }
         for c in DEFAULT_CLASSES
     ]
 
@@ -344,6 +603,9 @@ def _load_classes() -> None:
                                     "name": second["name"],
                                     "students": second["students"].copy(),
                                     "profiles": {},
+                                    "social_worker": "",
+                                    "subject": "",
+                                    "textbook_template": "",
                                 }
                             )
 
@@ -378,6 +640,10 @@ def _load_settings_from_browser() -> None:
         st.session_state.model_select = MODEL_OPTIONS[0]
     if "active_class_index" not in st.session_state:
         st.session_state.active_class_index = 0
+    if "teacher_name_input" not in st.session_state:
+        st.session_state.teacher_name_input = ""
+    if "form_entry_ids" not in st.session_state:
+        st.session_state.form_entry_ids = {}
 
     if _storage is not None:
         raw = None
@@ -397,6 +663,16 @@ def _load_settings_from_browser() -> None:
                         st.session_state.active_class_index = loaded[
                             "active_class_index"
                         ]
+                    if isinstance(loaded.get("teacher_name"), str):
+                        st.session_state.teacher_name_input = loaded["teacher_name"]
+                    if isinstance(loaded.get("form_entry_ids"), dict):
+                        st.session_state.form_entry_ids = {
+                            k: v
+                            for k, v in loaded["form_entry_ids"].items()
+                            if isinstance(k, str)
+                            and isinstance(v, str)
+                            and k in FORM_FIELD_KEYS
+                        }
             except Exception:
                 pass
         else:
@@ -429,6 +705,8 @@ def _save_settings_to_browser() -> None:
         "prefix": st.session_state.get("prefix_input", "😊"),
         "model": st.session_state.get("model_select", MODEL_OPTIONS[0]),
         "active_class_index": st.session_state.get("active_class_index", 0),
+        "teacher_name": st.session_state.get("teacher_name_input", ""),
+        "form_entry_ids": st.session_state.get("form_entry_ids", {}),
     }
     current_json = json.dumps(settings, ensure_ascii=False, sort_keys=True)
     if current_json != st.session_state.get("_last_saved_settings_json"):
@@ -456,6 +734,12 @@ def _init_active_class_widgets() -> None:
         st.session_state.class_name_input = cls["name"]
     if "students" not in st.session_state:
         st.session_state.students = cls["students"].copy()
+    if "class_social_worker" not in st.session_state:
+        st.session_state.class_social_worker = cls.get("social_worker", "")
+    if "class_subject" not in st.session_state:
+        st.session_state.class_subject = cls.get("subject", "")
+    if "class_textbook_template" not in st.session_state:
+        st.session_state.class_textbook_template = cls.get("textbook_template", "")
     for stud in cls["students"]:
         if f"profile_{stud}" not in st.session_state:
             st.session_state[f"profile_{stud}"] = cls["profiles"].get(stud, "")
@@ -481,6 +765,13 @@ def _sync_widgets_to_class(idx: int) -> None:
         if val:
             profiles[stud] = val
     cls["profiles"] = profiles
+    sw = (st.session_state.get("class_social_worker", "") or "").strip()
+    cls["social_worker"] = sw if sw in SOCIAL_WORKER_OPTIONS else ""
+    subj = (st.session_state.get("class_subject", "") or "").strip()
+    cls["subject"] = subj if subj in SUBJECT_OPTIONS else ""
+    cls["textbook_template"] = (
+        st.session_state.get("class_textbook_template", "") or ""
+    ).strip()
 
 
 def _load_class_into_widgets(idx: int) -> None:
@@ -492,6 +783,9 @@ def _load_class_into_widgets(idx: int) -> None:
     st.session_state.students_text_area = "\n".join(cls["students"])
     st.session_state.class_name_input = cls["name"]
     st.session_state.students = cls["students"].copy()
+    st.session_state.class_social_worker = cls.get("social_worker", "")
+    st.session_state.class_subject = cls.get("subject", "")
+    st.session_state.class_textbook_template = cls.get("textbook_template", "")
     for stud in cls["students"]:
         st.session_state[f"profile_{stud}"] = cls["profiles"].get(stud, "")
 
@@ -516,7 +810,14 @@ def _on_add_class_click() -> None:
     while new_name in existing:
         new_name = f"{base}{i}"
         i += 1
-    new_cls = {"name": new_name, "students": ["學生1"], "profiles": {}}
+    new_cls = {
+        "name": new_name,
+        "students": ["學生1"],
+        "profiles": {},
+        "social_worker": "",
+        "subject": "",
+        "textbook_template": "",
+    }
     st.session_state.classes.append(new_cls)
     new_idx = len(st.session_state.classes) - 1
     _load_class_into_widgets(new_idx)
@@ -686,6 +987,105 @@ with st.sidebar:
                 height=75,
                 placeholder="例：粗心、寫得快、進位借位易錯、用嚴肅語氣會修正",
             )
+
+    with st.expander("🏷️ 學期末表單設定（本班）", expanded=False):
+        st.caption(
+            "這些欄位會在學期末「📮 學期末交接表」區塊自動帶入；"
+            "每班各自儲存。"
+        )
+        _sw_idx = (
+            SOCIAL_WORKER_OPTIONS.index(st.session_state.class_social_worker)
+            if st.session_state.class_social_worker in SOCIAL_WORKER_OPTIONS
+            else 0
+        )
+        st.selectbox(
+            "主責社工（Q1）",
+            SOCIAL_WORKER_OPTIONS,
+            index=_sw_idx,
+            key="class_social_worker",
+            format_func=lambda v: "（未設定）" if not v else v,
+        )
+        _subj_idx = (
+            SUBJECT_OPTIONS.index(st.session_state.class_subject)
+            if st.session_state.class_subject in SUBJECT_OPTIONS
+            else 0
+        )
+        st.selectbox(
+            "負責科目（Q4）",
+            SUBJECT_OPTIONS,
+            index=_subj_idx,
+            key="class_subject",
+            format_func=lambda v: "（未設定）" if not v else v,
+        )
+        st.text_input(
+            "下學期欲領取課本（Q10 預設值）",
+            key="class_textbook_template",
+            placeholder="例：玩魔數第十一冊 (B)；不須申請則填「無」",
+            help="每位學生的 Q10 都會預設帶入這個值，需要時可逐位微調。",
+        )
+
+    with st.expander("📮 Google 表單設定（全域，只需設定一次）", expanded=False):
+        st.text_input(
+            "課輔老師姓名（Q3 會用這個）",
+            key="teacher_name_input",
+            placeholder="家人的本名",
+        )
+
+        st.markdown("**一次性：對應 Google 表單各題的 entry ID**")
+        _entry_ids = st.session_state.get("form_entry_ids", {}) or {}
+        _ready = len(_entry_ids)
+        if _ready >= len(FORM_FIELD_KEYS):
+            st.success(f"✅ 已設定 {_ready}/{len(FORM_FIELD_KEYS)} 個 entry ID")
+        elif _ready > 0:
+            st.warning(
+                f"⚠️ 目前 {_ready}/{len(FORM_FIELD_KEYS)} 題對應到；缺少："
+                + "、".join(
+                    FORM_FIELD_LABELS[k]
+                    for k in FORM_FIELD_KEYS
+                    if k not in _entry_ids
+                )
+            )
+        else:
+            st.warning("⚠️ 尚未設定，請依下方步驟貼入預填連結。")
+
+        st.caption(
+            "**步驟**：\n"
+            "1. 打開 Google 表單：[獅湖國小-學童交接表]"
+            f"(https://docs.google.com/forms/d/e/{SEMESTER_FORM_ID}/viewform)\n"
+            "2. 在每題填入下表指定的測試字串（下拉題選對應選項）：\n\n"
+            + "\n".join(
+                f"   - **{FORM_FIELD_LABELS[k]}**：填 `{FORM_FIELD_MARKERS[k]}`"
+                for k in FORM_FIELD_KEYS
+            )
+            + "\n\n3. 表單右上角「︙」→「**取得預填連結**」→ 複製連結\n"
+            "4. 把連結貼到下方，按「🔎 解析連結」"
+        )
+        st.text_area(
+            "貼入預填連結",
+            key="prefill_url_input",
+            height=100,
+            placeholder="https://docs.google.com/forms/d/e/.../viewform?usp=pp_url&entry...",
+        )
+        if st.button("🔎 解析連結", key="parse_prefill_url_btn"):
+            url_val = (st.session_state.get("prefill_url_input", "") or "").strip()
+            if not url_val:
+                st.warning("請先貼入預填連結")
+            else:
+                found = _extract_entry_ids_from_prefill_url(
+                    url_val, FORM_FIELD_MARKERS
+                )
+                if not found:
+                    st.error(
+                        "沒有解析出任何 entry ID；請確認連結格式、"
+                        "或檢查測試字串有沒有按上表填對。"
+                    )
+                else:
+                    st.session_state.form_entry_ids = found
+                    st.success(
+                        f"✅ 成功對應 {len(found)}/{len(FORM_FIELD_KEYS)} 題"
+                    )
+                    st.rerun()
+
     # 側邊欄結束前再同步一次，確保使用者剛打的內容會進 classes dict 並存到 localStorage
     _sync_widgets_to_class(st.session_state.active_class_index)
     _save_classes_to_browser()
@@ -922,3 +1322,282 @@ with _share_all_col:
             use_container_width=True,
             help="產生段落後才能分享",
         )
+
+
+# ================================================================
+# 📮 學期末交接表（獅湖國小）
+# ================================================================
+st.divider()
+st.subheader("📮 學期末交接表（獅湖國小）")
+st.caption(
+    "貼入整學期每日紀錄 → AI 依每位學生摘要 Q6–Q9 → 一鍵開啟預填 Google 表單，"
+    "家人檢查後按送出。"
+)
+
+_semester_class = _active_class()
+_sem_sw = _semester_class.get("social_worker", "")
+_sem_subj = _semester_class.get("subject", "")
+_sem_textbook = _semester_class.get("textbook_template", "")
+_sem_teacher = (st.session_state.get("teacher_name_input", "") or "").strip()
+_sem_entry_ids = st.session_state.get("form_entry_ids", {}) or {}
+
+# 目前班級資訊摘要＋前置檢查
+_cols_info = st.columns([2, 1, 1, 1])
+with _cols_info[0]:
+    st.markdown(
+        f"**目前班級**：{_semester_class['name']}　"
+        f"｜ 學生 {len(_semester_class['students'])} 位"
+    )
+with _cols_info[1]:
+    st.markdown(f"**社工**：{_sem_sw or '⚠️未設定'}")
+with _cols_info[2]:
+    st.markdown(f"**科目**：{_sem_subj or '⚠️未設定'}")
+with _cols_info[3]:
+    st.markdown(
+        f"**老師**：{_sem_teacher or '⚠️未設定'}　"
+        f"｜ entry {len(_sem_entry_ids)}/{len(FORM_FIELD_KEYS)}"
+    )
+
+_missing_setup: list[str] = []
+if not _sem_sw:
+    _missing_setup.append("班級的主責社工")
+if not _sem_subj:
+    _missing_setup.append("班級的負責科目")
+if not _sem_teacher:
+    _missing_setup.append("課輔老師姓名（全域）")
+if len(_sem_entry_ids) < len(FORM_FIELD_KEYS):
+    _missing_setup.append(
+        f"Google 表單 entry ID（目前 {len(_sem_entry_ids)}/{len(FORM_FIELD_KEYS)}）"
+    )
+
+if _missing_setup:
+    st.info(
+        "ℹ️ 還沒設定：" + "、".join(_missing_setup) + "。"
+        "沒設也可以試用解析功能，但「打開預填表單」會受影響。"
+        "到左側「🏷️ 學期末表單設定」和「📮 Google 表單設定」補完。"
+    )
+
+st.markdown("#### Step 1：貼入本學期每日紀錄")
+st.text_area(
+    "整學期紀錄",
+    key="semester_records_input",
+    height=250,
+    placeholder=(
+        "貼入格式範例（app 每日輸出的原格式）：\n"
+        "4/20（一）獅湖A班課程交接\n"
+        "🙂楊佩婕：今天已經可以注意到分數和整數的不同……\n"
+        "🙂李妍柔：今天的練習卷寫得又進步了一點……\n"
+        "\n"
+        "4/22（三）獅湖A班課程交接\n"
+        "🙂楊佩婕：……\n"
+        "……"
+    ),
+    label_visibility="collapsed",
+)
+
+_parse_col, _ = st.columns([1, 3])
+with _parse_col:
+    _parse_clicked = st.button(
+        "🔎 解析紀錄", key="parse_semester_btn", use_container_width=True
+    )
+
+if _parse_clicked:
+    _records_text = st.session_state.get("semester_records_input", "") or ""
+    _parsed = parse_semester_records(
+        _records_text, known_students=_semester_class["students"]
+    )
+    st.session_state.semester_parsed = _parsed
+    # 清掉上一輪的 AI 草稿，避免錯亂
+    for _stud in _semester_class["students"]:
+        for _q in ("Q6", "Q7", "Q8", "Q9", "Q10"):
+            st.session_state.pop(f"sem_{_q}_{_stud}", None)
+
+_parsed_records: dict[str, list[tuple[str, str]]] = st.session_state.get(
+    "semester_parsed", {}
+)
+
+if _parsed_records:
+    _total = sum(len(v) for v in _parsed_records.values())
+    _students_with = [
+        s for s in _semester_class["students"] if _parsed_records.get(s)
+    ]
+    _students_without = [
+        s for s in _semester_class["students"] if not _parsed_records.get(s)
+    ]
+    st.success(
+        f"✅ 解析出 {len(_students_with)} 位學生、共 {_total} 筆段落。"
+        + (
+            "　⚠️ 這些學生沒有紀錄：" + "、".join(_students_without)
+            if _students_without
+            else ""
+        )
+    )
+
+    st.markdown("#### Step 2：為每位學生產生 Q6–Q9 草稿 → 打開預填表單")
+
+    if st.button(
+        "🚀 一次分析全部學生（有紀錄的才會打）",
+        key="bulk_analyze_btn",
+        type="primary",
+    ):
+        if not client:
+            st.error("請先在左側填入 Gemini API Key")
+        else:
+            _bulk_tasks = [
+                (s, _parsed_records[s])
+                for s in _semester_class["students"]
+                if _parsed_records.get(s)
+            ]
+            _start = time.time()
+            _prog = st.progress(0.0, text=f"開始分析 {len(_bulk_tasks)} 位學生...")
+            _bulk_failures: list[str] = []
+            _bulk_results: dict[str, dict[str, str]] = {}
+            with ThreadPoolExecutor(max_workers=min(len(_bulk_tasks), 5)) as pool:
+                _futs = {
+                    pool.submit(
+                        build_semester_summary,
+                        client,
+                        model,
+                        _s,
+                        _recs,
+                        _sem_subj,
+                    ): _s
+                    for _s, _recs in _bulk_tasks
+                }
+                _done = 0
+                for _fut in as_completed(_futs):
+                    _s = _futs[_fut]
+                    _done += 1
+                    try:
+                        _bulk_results[_s] = _fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        _bulk_failures.append(f"{_s}：{exc}")
+                    _prog.progress(
+                        _done / len(_bulk_tasks),
+                        text=f"已完成 {_done}/{len(_bulk_tasks)}",
+                    )
+            _prog.progress(1.0, text=f"完成（共 {time.time()-_start:.1f} 秒）")
+            # 把結果寫進 widget 用的 session_state，下一輪 rerun 會顯示
+            _pending_widget = st.session_state.get("_pending_widget_state", {})
+            for _s, _r in _bulk_results.items():
+                _pending_widget[f"sem_Q6_{_s}"] = _r.get("Q6", "")
+                _pending_widget[f"sem_Q7_{_s}"] = _r.get("Q7", "")
+                _pending_widget[f"sem_Q8_{_s}"] = _r.get("Q8", "")
+                _pending_widget[f"sem_Q9_{_s}"] = _r.get("Q9", "")
+                # Q10 還是用班級模板（使用者可再編輯）
+                if f"sem_Q10_{_s}" not in st.session_state:
+                    _pending_widget[f"sem_Q10_{_s}"] = _sem_textbook
+            st.session_state._pending_widget_state = _pending_widget
+            if _bulk_failures:
+                st.session_state._pending_failures = _bulk_failures
+            st.rerun()
+
+    for _stud in _semester_class["students"]:
+        _recs = _parsed_records.get(_stud, [])
+        _label = f"😊 {_stud}（{len(_recs)} 筆紀錄）"
+        with st.expander(_label, expanded=bool(_recs)):
+            if not _recs:
+                st.caption("此學生沒有解析到紀錄，請回 Step 1 檢查格式或學生名單。")
+                continue
+
+            _ai_clicked = st.button(
+                "🤖 AI 分析本學期", key=f"sem_analyze_{_stud}"
+            )
+            if _ai_clicked:
+                if not client:
+                    st.error("請先在左側填入 Gemini API Key")
+                else:
+                    try:
+                        with st.spinner(f"分析 {_stud} 的整學期紀錄..."):
+                            _result = build_semester_summary(
+                                client, model, _stud, _recs, _sem_subj
+                            )
+                        # 透過 pending 機制更新 widget
+                        _pending_widget = st.session_state.get(
+                            "_pending_widget_state", {}
+                        )
+                        _pending_widget[f"sem_Q6_{_stud}"] = _result.get("Q6", "")
+                        _pending_widget[f"sem_Q7_{_stud}"] = _result.get("Q7", "")
+                        _pending_widget[f"sem_Q8_{_stud}"] = _result.get("Q8", "")
+                        _pending_widget[f"sem_Q9_{_stud}"] = _result.get("Q9", "")
+                        if f"sem_Q10_{_stud}" not in st.session_state:
+                            _pending_widget[f"sem_Q10_{_stud}"] = _sem_textbook
+                        st.session_state._pending_widget_state = _pending_widget
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"AI 分析失敗：{exc}")
+
+            # 初始化 Q10 預設值（第一次看到此學生時填入班級模板）
+            if f"sem_Q10_{_stud}" not in st.session_state:
+                st.session_state[f"sem_Q10_{_stud}"] = _sem_textbook
+
+            st.text_input(
+                "Q6 下學期需補考單元（英/國請填「無」）",
+                key=f"sem_Q6_{_stud}",
+                placeholder="例：5-2、5-4；若都通過或非數學科請填「無」",
+            )
+            st.text_input(
+                "Q7 下學期起始單元",
+                key=f"sem_Q7_{_stud}",
+                placeholder="例：5-3、5-5；（英）第一冊Ch4",
+            )
+            st.text_area(
+                "Q8 學習表現 & 有效教學方式",
+                key=f"sem_Q8_{_stud}",
+                height=180,
+                placeholder="AI 草稿會出現在這裡，可直接編輯。",
+            )
+            st.text_area(
+                "Q9 行為情緒 & 有效處理方式",
+                key=f"sem_Q9_{_stud}",
+                height=180,
+                placeholder="AI 草稿會出現在這裡，可直接編輯。",
+            )
+            st.text_input(
+                "Q10 欲領取新課本",
+                key=f"sem_Q10_{_stud}",
+                placeholder="例：玩魔數第十一冊 (B)；不須申請則填「無」",
+            )
+
+            _answers = {
+                "social_worker": _sem_sw,
+                "class_name": _semester_class["name"],
+                "teacher_name": _sem_teacher,
+                "subject": _sem_subj,
+                "student_name": _stud,
+                "remedial_units": st.session_state.get(f"sem_Q6_{_stud}", ""),
+                "next_start_unit": st.session_state.get(f"sem_Q7_{_stud}", ""),
+                "learning_performance": st.session_state.get(f"sem_Q8_{_stud}", ""),
+                "behavior_emotion": st.session_state.get(f"sem_Q9_{_stud}", ""),
+                "textbook": st.session_state.get(f"sem_Q10_{_stud}", ""),
+            }
+            _ready_to_submit = (
+                len(_sem_entry_ids) == len(FORM_FIELD_KEYS)
+                and _sem_sw
+                and _sem_subj
+                and _sem_teacher
+                and any(_answers.values())
+            )
+            if _ready_to_submit:
+                _prefill = build_prefill_url(
+                    SEMESTER_FORM_ID, _sem_entry_ids, _answers
+                )
+                st.link_button(
+                    f"📮 打開 {_stud} 的預填表單（新分頁）",
+                    _prefill,
+                    use_container_width=True,
+                )
+            else:
+                st.button(
+                    f"📮 打開 {_stud} 的預填表單",
+                    disabled=True,
+                    use_container_width=True,
+                    help=(
+                        "需要先補完：Q1 社工、Q4 科目、Q3 老師姓名、"
+                        "以及完整 10 題的 entry ID 對應。"
+                    ),
+                )
+else:
+    st.caption(
+        "（貼入紀錄並按「🔎 解析紀錄」後，這裡會出現每位學生的設定卡片）"
+    )
