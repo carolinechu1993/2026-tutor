@@ -441,41 +441,66 @@ def build_semester_summary(
         f"{joined}\n\n"
         f"請依上述系統指示，輸出嚴格 JSON 物件，包含 Q6、Q7、Q8、Q9 四個欄位。"
     )
+    def _call(candidate_model: str) -> dict[str, str]:
+        response = client.models.generate_content(
+            model=candidate_model,
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SEMESTER_SUMMARY_SYSTEM_PROMPT,
+                # 4000 是粗估上限：Q8+Q9 各要寫到 500 字（~1200 tokens），加上 Q6/Q7
+                # 與 JSON 結構本身的 token 開銷，2000 會邊緣，故留雙倍 headroom。
+                max_output_tokens=4000,
+                temperature=0.6,
+                response_mime_type="application/json",
+            ),
+        )
+        text = (response.text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini 回傳空內容，可能被安全過濾器擋下。")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as je:
+            # 截斷／格式壞掉 → 把原文帶在錯誤訊息裡，方便 debug
+            raise RuntimeError(
+                f"Gemini 回傳的 JSON 無法解析（可能被截斷）：{je}\n"
+                f"原始回傳前 400 字：{text[:400]}"
+            ) from je
+        out_ = {
+            "Q6": str(data.get("Q6", "")).strip(),
+            "Q7": str(data.get("Q7", "")).strip(),
+            "Q8": str(data.get("Q8", "")).strip(),
+            "Q9": str(data.get("Q9", "")).strip(),
+        }
+        if subject.strip() and subject.strip() != "數學":
+            out_["Q6"] = "無"
+        return out_
+
     models_to_try = FALLBACK_CHAIN.get(model, [model])
     last_exc: Exception | None = None
     for candidate in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=candidate,
-                contents=user_prompt,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=SEMESTER_SUMMARY_SYSTEM_PROMPT,
-                    max_output_tokens=2000,
-                    temperature=0.6,
-                    response_mime_type="application/json",
-                ),
-            )
-            text = (response.text or "").strip()
-            if not text:
-                raise RuntimeError("Gemini 回傳空內容，可能被安全過濾器擋下。")
-            data = json.loads(text)
-            out = {
-                "Q6": str(data.get("Q6", "")).strip(),
-                "Q7": str(data.get("Q7", "")).strip(),
-                "Q8": str(data.get("Q8", "")).strip(),
-                "Q9": str(data.get("Q9", "")).strip(),
-            }
-            # 非數學科一律 Q6 = 無（保險起見再覆寫一次）
-            if subject.strip() and subject.strip() != "數學":
-                out["Q6"] = "無"
-            return out
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if _is_transient(exc):
-                continue
-            raise
+        # 每個模型最多試 2 次：第一次失敗若是 transient 或 JSON 解析問題，重試一次再換
+        for attempt in range(2):
+            try:
+                return _call(candidate)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                # JSON 解析壞掉：重試同一個模型一次（隨機性重跑通常會好）
+                if isinstance(exc, RuntimeError) and "JSON" in str(exc):
+                    if attempt == 0:
+                        time.sleep(0.5)
+                        continue
+                    # 兩次都壞就往下一個 fallback 模型試
+                    break
+                # Transient 錯誤：短暫 sleep 再試同一模型
+                if _is_transient(exc):
+                    if attempt == 0:
+                        time.sleep(1.0 * (2 ** attempt))
+                        continue
+                    break  # 換下一個模型
+                # 非 transient 非 JSON：直接 raise
+                raise
     raise RuntimeError(
-        f"所有 Gemini 備援模型目前都在過載中。請稍等再試。\n\n{last_exc}"
+        f"所有 Gemini 備援模型都失敗了。請稍等再試。\n\n最後一次錯誤：{last_exc}"
     )
 
 
@@ -1477,6 +1502,16 @@ with tab_semester:
 
         st.markdown("#### Step 2：為每位學生產生 Q6–Q9 草稿 → 打開預填表單")
 
+        # 顯示上一輪批次分析的失敗訊息（如果有）
+        if st.session_state.get("_pending_sem_failures"):
+            for _msg in st.session_state._pending_sem_failures:
+                st.warning(f"⚠️ 批次分析失敗：{_msg}")
+            st.caption(
+                "上面列的學生欄位會是空白；可以對該學生單獨按「🤖 AI 分析本學期」"
+                "重試一次，通常是 Gemini 偶發的格式或截斷問題。"
+            )
+            st.session_state._pending_sem_failures = []
+
         if st.button(
             "🚀 一次分析全部學生（有紀錄的才會打）",
             key="bulk_analyze_btn",
@@ -1531,7 +1566,9 @@ with tab_semester:
                         _pending_widget[f"sem_Q10_{_s}"] = _sem_textbook
                 st.session_state._pending_widget_state = _pending_widget
                 if _bulk_failures:
-                    st.session_state._pending_failures = _bulk_failures
+                    # 把失敗訊息放到學期末 tab 專用的 key，避免跟每日 tab 的
+                    # _pending_failures 混在一起（使用者會看不到）
+                    st.session_state._pending_sem_failures = _bulk_failures
                 st.rerun()
 
         for _stud in _semester_class["students"]:
