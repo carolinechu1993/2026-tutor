@@ -46,6 +46,7 @@ DEFAULT_CLASSES = [
         "social_worker": "",
         "subject": "",
         "textbook_template": "",
+        "form_school": "甲圍國小",
     },
     {
         "name": "獅湖A班",
@@ -54,12 +55,18 @@ DEFAULT_CLASSES = [
         "social_worker": "",
         "subject": "",
         "textbook_template": "",
+        "form_school": "獅湖國小",
     },
 ]
 TAIPEI_TZ = ZoneInfo("Asia/Taipei") if ZoneInfo else None
 
-# 學期末交接表（獅湖國小）相關常數
-SEMESTER_FORM_ID = "1FAIpQLSdr6_EapIcZn_qHIla-83FaD2vIpO6Iv-_7lXLzkOgfyYYSPA"
+# 學期末交接表：兩所學校用同一個 template，entry ID 完全一樣，只差 form ID。
+# 新學校若加進來、entry ID 不一樣時，到「🌐 重新偵測」按鈕重抓。
+FORM_SCHOOLS = {
+    "甲圍國小": "1FAIpQLScQsM3y26jMr7iK5r4m7Se0mNtQmB7M7bnVs9nzqKFYnslKwA",
+    "獅湖國小": "1FAIpQLSdr6_EapIcZn_qHIla-83FaD2vIpO6Iv-_7lXLzkOgfyYYSPA",
+}
+SCHOOL_OPTIONS = [""] + list(FORM_SCHOOLS.keys())
 SOCIAL_WORKER_OPTIONS = ["", "謝秀玉", "賴姿岑", "曾巧怡"]
 SUBJECT_OPTIONS = ["", "英文", "國語", "數學"]
 # 10 題的內部 key（order matters：用於顯示、預填對應）
@@ -539,6 +546,7 @@ def _normalize_class(raw: object) -> dict | None:
         "social_worker": _str_field("social_worker", SOCIAL_WORKER_OPTIONS),
         "subject": _str_field("subject", SUBJECT_OPTIONS),
         "textbook_template": _str_field("textbook_template"),
+        "form_school": _str_field("form_school", SCHOOL_OPTIONS),
     }
 
 
@@ -551,6 +559,7 @@ def _default_classes_copy() -> list[dict]:
             "social_worker": c.get("social_worker", ""),
             "subject": c.get("subject", ""),
             "textbook_template": c.get("textbook_template", ""),
+            "form_school": c.get("form_school", ""),
         }
         for c in DEFAULT_CLASSES
     ]
@@ -628,6 +637,7 @@ def _load_classes() -> None:
                                     "social_worker": "",
                                     "subject": "",
                                     "textbook_template": "",
+                                    "form_school": second.get("form_school", ""),
                                 }
                             )
 
@@ -763,6 +773,8 @@ def _init_active_class_widgets() -> None:
         st.session_state.class_subject = cls.get("subject", "")
     if "class_textbook_template" not in st.session_state:
         st.session_state.class_textbook_template = cls.get("textbook_template", "")
+    if "class_form_school" not in st.session_state:
+        st.session_state.class_form_school = cls.get("form_school", "")
     for stud in cls["students"]:
         if f"profile_{stud}" not in st.session_state:
             st.session_state[f"profile_{stud}"] = cls["profiles"].get(stud, "")
@@ -795,6 +807,8 @@ def _sync_widgets_to_class(idx: int) -> None:
     cls["textbook_template"] = (
         st.session_state.get("class_textbook_template", "") or ""
     ).strip()
+    school = (st.session_state.get("class_form_school", "") or "").strip()
+    cls["form_school"] = school if school in SCHOOL_OPTIONS else ""
 
 
 def _load_class_into_widgets(idx: int) -> None:
@@ -809,6 +823,7 @@ def _load_class_into_widgets(idx: int) -> None:
     st.session_state.class_social_worker = cls.get("social_worker", "")
     st.session_state.class_subject = cls.get("subject", "")
     st.session_state.class_textbook_template = cls.get("textbook_template", "")
+    st.session_state.class_form_school = cls.get("form_school", "")
     for stud in cls["students"]:
         st.session_state[f"profile_{stud}"] = cls["profiles"].get(stud, "")
 
@@ -840,6 +855,7 @@ def _on_add_class_click() -> None:
         "social_worker": "",
         "subject": "",
         "textbook_template": "",
+        "form_school": "",
     }
     st.session_state.classes.append(new_cls)
     new_idx = len(st.session_state.classes) - 1
@@ -1016,6 +1032,19 @@ with st.sidebar:
             "這些欄位會在學期末「📮 學期末交接表」區塊自動帶入；"
             "每班各自儲存。"
         )
+        _school_idx = (
+            SCHOOL_OPTIONS.index(st.session_state.class_form_school)
+            if st.session_state.class_form_school in SCHOOL_OPTIONS
+            else 0
+        )
+        st.selectbox(
+            "學校表單",
+            SCHOOL_OPTIONS,
+            index=_school_idx,
+            key="class_form_school",
+            format_func=lambda v: "（未設定）" if not v else v,
+            help="決定預填表單要開哪一所學校。",
+        )
         _sw_idx = (
             SOCIAL_WORKER_OPTIONS.index(st.session_state.class_social_worker)
             if st.session_state.class_social_worker in SOCIAL_WORKER_OPTIONS
@@ -1064,23 +1093,31 @@ with st.sidebar:
                 "按下方按鈕重抓。"
             )
         st.caption(
-            "entry ID 預設用已知的獅湖國小表單值，一般不用動。"
-            "若表單結構改了、預填連結跑版，按下方按鈕從公開 HTML 重抓。"
+            "兩所學校的表單目前共用同一組 entry ID（同 template 複製）。"
+            "若哪天跑版了，選一所學校按下方按鈕重抓。"
         )
-        if st.button("🌐 重新偵測 entry ID", key="refetch_entry_ids_btn"):
-            try:
-                with st.spinner("向 Google 表單抓取 entry ID..."):
-                    fresh = fetch_entry_ids_from_google_form(SEMESTER_FORM_ID)
-                if not fresh:
-                    st.error("沒抓到任何 entry ID。")
-                else:
-                    st.session_state.form_entry_ids = fresh
-                    st.success(
-                        f"✅ 重新對應 {len(fresh)}/{len(FORM_FIELD_KEYS)} 題"
-                    )
-                    st.rerun()
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"重抓失敗：{exc}")
+        _refetch_cols = st.columns(len(FORM_SCHOOLS))
+        for _i, (_sch, _fid) in enumerate(FORM_SCHOOLS.items()):
+            with _refetch_cols[_i]:
+                if st.button(
+                    f"🌐 重抓 {_sch}",
+                    key=f"refetch_entry_ids_{_sch}",
+                    use_container_width=True,
+                ):
+                    try:
+                        with st.spinner(f"抓 {_sch} entry ID..."):
+                            fresh = fetch_entry_ids_from_google_form(_fid)
+                        if not fresh:
+                            st.error("沒抓到任何 entry ID。")
+                        else:
+                            st.session_state.form_entry_ids = fresh
+                            st.success(
+                                f"✅ {_sch}：重新對應 "
+                                f"{len(fresh)}/{len(FORM_FIELD_KEYS)} 題"
+                            )
+                            st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"重抓失敗：{exc}")
 
     # 側邊欄結束前再同步一次，確保使用者剛打的內容會進 classes dict 並存到 localStorage
     _sync_widgets_to_class(st.session_state.active_class_index)
@@ -1321,40 +1358,49 @@ with _share_all_col:
 
 
 # ================================================================
-# 📮 學期末交接表（獅湖國小）
+# 📮 學期末交接表
 # ================================================================
 st.divider()
-st.subheader("📮 學期末交接表（獅湖國小）")
-st.caption(
-    "貼入整學期每日紀錄 → AI 依每位學生摘要 Q6–Q9 → 一鍵開啟預填 Google 表單，"
-    "家人檢查後按送出。"
-)
-
 _semester_class = _active_class()
+_sem_school = _semester_class.get("form_school", "")
 _sem_sw = _semester_class.get("social_worker", "")
 _sem_subj = _semester_class.get("subject", "")
 _sem_textbook = _semester_class.get("textbook_template", "")
 _sem_teacher = (st.session_state.get("teacher_name_input", "") or "").strip()
 _sem_entry_ids = st.session_state.get("form_entry_ids", {}) or {}
+_sem_form_id = FORM_SCHOOLS.get(_sem_school, "")
+
+_section_title = "📮 學期末交接表"
+if _sem_school:
+    _section_title += f"（{_sem_school}）"
+st.subheader(_section_title)
+st.caption(
+    "貼入整學期每日紀錄 → AI 依每位學生摘要 Q6–Q9 → 一鍵開啟預填 Google 表單，"
+    "家人檢查後按送出。"
+)
 
 # 目前班級資訊摘要＋前置檢查
-_cols_info = st.columns([2, 1, 1, 1])
+_cols_info = st.columns([2, 1, 1, 1, 1])
 with _cols_info[0]:
     st.markdown(
         f"**目前班級**：{_semester_class['name']}　"
         f"｜ 學生 {len(_semester_class['students'])} 位"
     )
 with _cols_info[1]:
-    st.markdown(f"**社工**：{_sem_sw or '⚠️未設定'}")
+    st.markdown(f"**學校**：{_sem_school or '⚠️未設定'}")
 with _cols_info[2]:
-    st.markdown(f"**科目**：{_sem_subj or '⚠️未設定'}")
+    st.markdown(f"**社工**：{_sem_sw or '⚠️未設定'}")
 with _cols_info[3]:
+    st.markdown(f"**科目**：{_sem_subj or '⚠️未設定'}")
+with _cols_info[4]:
     st.markdown(
         f"**老師**：{_sem_teacher or '⚠️未設定'}　"
         f"｜ entry {len(_sem_entry_ids)}/{len(FORM_FIELD_KEYS)}"
     )
 
 _missing_setup: list[str] = []
+if not _sem_school:
+    _missing_setup.append("班級的學校表單")
 if not _sem_sw:
     _missing_setup.append("班級的主責社工")
 if not _sem_subj:
@@ -1568,7 +1614,8 @@ if _parsed_records:
                 "textbook": st.session_state.get(f"sem_Q10_{_stud}", ""),
             }
             _ready_to_submit = (
-                len(_sem_entry_ids) == len(FORM_FIELD_KEYS)
+                bool(_sem_form_id)
+                and len(_sem_entry_ids) == len(FORM_FIELD_KEYS)
                 and _sem_sw
                 and _sem_subj
                 and _sem_teacher
@@ -1576,10 +1623,10 @@ if _parsed_records:
             )
             if _ready_to_submit:
                 _prefill = build_prefill_url(
-                    SEMESTER_FORM_ID, _sem_entry_ids, _answers
+                    _sem_form_id, _sem_entry_ids, _answers
                 )
                 st.link_button(
-                    f"📮 打開 {_stud} 的預填表單（新分頁）",
+                    f"📮 打開 {_stud} 的 {_sem_school} 預填表單（新分頁）",
                     _prefill,
                     use_container_width=True,
                 )
@@ -1589,7 +1636,7 @@ if _parsed_records:
                     disabled=True,
                     use_container_width=True,
                     help=(
-                        "需要先補完：Q1 社工、Q4 科目、Q3 老師姓名、"
+                        "需要先補完：學校、Q1 社工、Q4 科目、Q3 老師姓名、"
                         "以及完整 10 題的 entry ID 對應。"
                     ),
                 )
