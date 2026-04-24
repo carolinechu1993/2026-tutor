@@ -75,18 +75,19 @@ FORM_FIELD_KEYS = [
     "behavior_emotion",      # Q9 行為情緒 & 處理方式
     "textbook",              # Q10 欲領取新課本
 ]
-# 「取得預填連結」時使用者要在每題填入的識別字串（Q1、Q4 是下拉，用選項實值）
-FORM_FIELD_MARKERS = {
-    "social_worker": "謝秀玉",          # Q1：測試時請選「謝秀玉」
-    "class_name": "MARK_CLASS",
-    "teacher_name": "MARK_TEACHER",
-    "subject": "數學",                   # Q4：測試時請選「數學」
-    "student_name": "MARK_STUDENT",
-    "remedial_units": "MARK_REMEDIAL",
-    "next_start_unit": "MARK_NEXT_UNIT",
-    "learning_performance": "MARK_LEARNING",
-    "behavior_emotion": "MARK_BEHAVIOR",
-    "textbook": "MARK_TEXTBOOK",
+# 獅湖國小-學童交接表的 10 個 entry ID（2026-04 從公開 HTML 抓到的）。
+# 若表單結構改變，app 介面有「🌐 重新偵測 entry ID」按鈕會重抓覆蓋。
+DEFAULT_FORM_ENTRY_IDS = {
+    "social_worker": "entry.1491901571",
+    "class_name": "entry.1194643748",
+    "teacher_name": "entry.1049403590",
+    "subject": "entry.143368371",
+    "student_name": "entry.1947043238",
+    "remedial_units": "entry.147433532",
+    "next_start_unit": "entry.1163122093",
+    "learning_performance": "entry.2091216910",
+    "behavior_emotion": "entry.403203193",
+    "textbook": "entry.1519759633",
 }
 # 顯示用標籤
 FORM_FIELD_LABELS = {
@@ -316,34 +317,55 @@ def parse_semester_records(
     return result
 
 
-def _extract_entry_ids_from_prefill_url(
-    url: str, markers: dict[str, str]
-) -> dict[str, str]:
-    """從 Google Form 的「取得預填連結」URL 抽取 entry.XXX 與題目的對應。
+def fetch_entry_ids_from_google_form(form_id: str) -> dict[str, str]:
+    """從公開 Google Form 的 HTML 抽取每題的 entry.XXX ID。
 
-    做法：URL 裡每個 `entry.NNNN=<value>` 的 value 會跟 markers[field]
-    比對，若 URL-decode 後相等就把該 entry ID 對到該欄位。
+    做法：下載 /viewform HTML，從內嵌的 FB_PUBLIC_LOAD_DATA_ JSON 讀取題目
+    結構。非題目的 section header（type=8）會被略過。回傳依序對應到
+    FORM_FIELD_KEYS 的 dict（若題目數與 FORM_FIELD_KEYS 不一致，盡力對應
+    前幾題）。
 
-    回傳只包含成功對應到的欄位。
+    失敗會 raise，由呼叫端顯示錯誤。
     """
-    if not url or not url.strip():
-        return {}
+    import urllib.request
+
+    url = f"https://docs.google.com/forms/d/e/{form_id}/viewform"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    m = re.search(
+        r"FB_PUBLIC_LOAD_DATA_\s*=\s*(\[.*?\]);?\s*</script>", html, re.S
+    )
+    if not m:
+        raise RuntimeError(
+            "找不到表單資料（FB_PUBLIC_LOAD_DATA_）。"
+            "可能是 Google 改了頁面結構，或表單已關閉。"
+        )
+    data = json.loads(m.group(1))
     try:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    except Exception:
-        return {}
-    found: dict[str, str] = {}
-    for key, value in params:
-        if not key.startswith("entry."):
-            continue
-        for field_key, marker in markers.items():
-            if field_key in found:
+        questions = data[1][1]
+    except Exception as exc:
+        raise RuntimeError(f"表單資料格式非預期：{exc}") from exc
+
+    entry_ids_in_order: list[str] = []
+    for q in questions:
+        try:
+            q_type = q[3]
+            # type=8 是 section header，沒有 entry ID；跳過
+            if q_type == 8:
                 continue
-            if value == marker:
-                found[field_key] = key
-                break
-    return found
+            entry_num = q[4][0][0] if q[4] and q[4][0] else None
+            if entry_num is None:
+                continue
+            entry_ids_in_order.append(f"entry.{entry_num}")
+        except Exception:
+            continue
+
+    # 依序對應到 FORM_FIELD_KEYS
+    result: dict[str, str] = {}
+    for key, entry_id in zip(FORM_FIELD_KEYS, entry_ids_in_order):
+        result[key] = entry_id
+    return result
 
 
 def build_prefill_url(
@@ -643,7 +665,8 @@ def _load_settings_from_browser() -> None:
     if "teacher_name_input" not in st.session_state:
         st.session_state.teacher_name_input = ""
     if "form_entry_ids" not in st.session_state:
-        st.session_state.form_entry_ids = {}
+        # 預設用硬寫死的 entry ID（已知獅湖國小表單值），免得家人第一次還要設定
+        st.session_state.form_entry_ids = dict(DEFAULT_FORM_ENTRY_IDS)
 
     if _storage is not None:
         raw = None
@@ -1024,67 +1047,40 @@ with st.sidebar:
             help="每位學生的 Q10 都會預設帶入這個值，需要時可逐位微調。",
         )
 
-    with st.expander("📮 Google 表單設定（全域，只需設定一次）", expanded=False):
+    with st.expander("📮 Google 表單設定（全域，一般不需動）", expanded=False):
         st.text_input(
             "課輔老師姓名（Q3 會用這個）",
             key="teacher_name_input",
             placeholder="家人的本名",
         )
 
-        st.markdown("**一次性：對應 Google 表單各題的 entry ID**")
         _entry_ids = st.session_state.get("form_entry_ids", {}) or {}
         _ready = len(_entry_ids)
         if _ready >= len(FORM_FIELD_KEYS):
-            st.success(f"✅ 已設定 {_ready}/{len(FORM_FIELD_KEYS)} 個 entry ID")
-        elif _ready > 0:
-            st.warning(
-                f"⚠️ 目前 {_ready}/{len(FORM_FIELD_KEYS)} 題對應到；缺少："
-                + "、".join(
-                    FORM_FIELD_LABELS[k]
-                    for k in FORM_FIELD_KEYS
-                    if k not in _entry_ids
-                )
-            )
+            st.success(f"✅ entry ID 已對應 {_ready}/{len(FORM_FIELD_KEYS)} 題")
         else:
-            st.warning("⚠️ 尚未設定，請依下方步驟貼入預填連結。")
-
-        st.caption(
-            "**步驟**：\n"
-            "1. 打開 Google 表單：[獅湖國小-學童交接表]"
-            f"(https://docs.google.com/forms/d/e/{SEMESTER_FORM_ID}/viewform)\n"
-            "2. 在每題填入下表指定的測試字串（下拉題選對應選項）：\n\n"
-            + "\n".join(
-                f"   - **{FORM_FIELD_LABELS[k]}**：填 `{FORM_FIELD_MARKERS[k]}`"
-                for k in FORM_FIELD_KEYS
+            st.warning(
+                f"⚠️ 目前只對應到 {_ready}/{len(FORM_FIELD_KEYS)} 題，"
+                "按下方按鈕重抓。"
             )
-            + "\n\n3. 表單右上角「︙」→「**取得預填連結**」→ 複製連結\n"
-            "4. 把連結貼到下方，按「🔎 解析連結」"
+        st.caption(
+            "entry ID 預設用已知的獅湖國小表單值，一般不用動。"
+            "若表單結構改了、預填連結跑版，按下方按鈕從公開 HTML 重抓。"
         )
-        st.text_area(
-            "貼入預填連結",
-            key="prefill_url_input",
-            height=100,
-            placeholder="https://docs.google.com/forms/d/e/.../viewform?usp=pp_url&entry...",
-        )
-        if st.button("🔎 解析連結", key="parse_prefill_url_btn"):
-            url_val = (st.session_state.get("prefill_url_input", "") or "").strip()
-            if not url_val:
-                st.warning("請先貼入預填連結")
-            else:
-                found = _extract_entry_ids_from_prefill_url(
-                    url_val, FORM_FIELD_MARKERS
-                )
-                if not found:
-                    st.error(
-                        "沒有解析出任何 entry ID；請確認連結格式、"
-                        "或檢查測試字串有沒有按上表填對。"
-                    )
+        if st.button("🌐 重新偵測 entry ID", key="refetch_entry_ids_btn"):
+            try:
+                with st.spinner("向 Google 表單抓取 entry ID..."):
+                    fresh = fetch_entry_ids_from_google_form(SEMESTER_FORM_ID)
+                if not fresh:
+                    st.error("沒抓到任何 entry ID。")
                 else:
-                    st.session_state.form_entry_ids = found
+                    st.session_state.form_entry_ids = fresh
                     st.success(
-                        f"✅ 成功對應 {len(found)}/{len(FORM_FIELD_KEYS)} 題"
+                        f"✅ 重新對應 {len(fresh)}/{len(FORM_FIELD_KEYS)} 題"
                     )
                     st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"重抓失敗：{exc}")
 
     # 側邊欄結束前再同步一次，確保使用者剛打的內容會進 classes dict 並存到 localStorage
     _sync_widgets_to_class(st.session_state.active_class_index)
