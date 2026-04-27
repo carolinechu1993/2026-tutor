@@ -224,6 +224,31 @@ def _is_transient(exc: Exception) -> bool:
     return any(tok in str(exc) for tok in TRANSIENT_ERROR_TOKENS)
 
 
+def _build_daily_config():
+    """日常產段落不需要 thinking（單純把關鍵字擴寫成自然段落），把 thinking 關掉
+    避免吃掉 max_output_tokens 額度造成段落被截。若 SDK 版本不支援
+    thinking_config（舊版），就退回不傳這個參數。"""
+    cfg_kwargs = dict(
+        system_instruction=SYSTEM_PROMPT,
+        # 從 800 拉到 3000：給足夠的 headroom，即使 thinking_config 在某些
+        # 模型／版本上沒效果，也不會被截斷在中段（中文 95-125 字 ≈ 200 tokens）
+        max_output_tokens=3000,
+        temperature=0.7,
+    )
+    try:
+        cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+            thinking_budget=0
+        )
+    except (AttributeError, TypeError):
+        pass
+    try:
+        return genai_types.GenerateContentConfig(**cfg_kwargs)
+    except TypeError:
+        # SDK 不認 thinking_config kwarg → 拿掉再試
+        cfg_kwargs.pop("thinking_config", None)
+        return genai_types.GenerateContentConfig(**cfg_kwargs)
+
+
 def _try_one_model(
     client, model: str, name: str, notes: str, length: str, max_retries: int = 2
 ) -> str:
@@ -232,11 +257,7 @@ def _try_one_model(
             response = client.models.generate_content(
                 model=model,
                 contents=build_user_prompt(name, notes, length),
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=800,
-                    temperature=0.7,
-                ),
+                config=_build_daily_config(),
             )
             text = (response.text or "").strip()
             if not text:
